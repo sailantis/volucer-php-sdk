@@ -530,13 +530,23 @@ final class Worker
                     break;
 
                 case MessageType::REQUEST:
-                    // The mirror of the `JOB` arm in `run()`: a request on a consumer has nowhere to
-                    // go, and answering it with a response would be a protocol error on the server —
-                    // so it is named and refused rather than guessed at.
+                    // The mirror of the `JOB` arm in `run()`: a request on a consumer has nowhere to go.
+                    // Answered with an `ERROR` rather than only diagnosed, and that is not politeness:
+                    // the server's request path has a 30-second deadline and its answer to a missed one
+                    // is to kill the worker. A silent consumer would therefore turn a one-line
+                    // configuration mistake into a worker killed once a minute, with nothing in the log
+                    // saying why. A non-recoverable `ERROR` is reported as a protocol failure *without*
+                    // discarding the worker, which is the honest outcome: the stream is aligned, the
+                    // deployment is wrong.
                     $this->diagnose(
                         'the server sent a REQUEST to a worker that consumes jobs; this worker is '
                         . 'configured for the wrong mode'
                     );
+                    $this->sendJson(MessageType::ERROR, $header->requestId, [
+                        'message' => 'this worker consumes jobs, not requests',
+                        'request_id' => $header->requestId,
+                        'recoverable' => false,
+                    ]);
                     break;
 
                 default:

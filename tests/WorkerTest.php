@@ -2163,6 +2163,18 @@ Assert::same(
     count(json_of($requestOnConsumer['frames'], MessageType::RESPONSE)),
     'and is not answered with a response, which the server would reject as a protocol error',
 );
+$refusedRequest = json_of($requestOnConsumer['frames'], MessageType::ERROR);
+Assert::same(
+    1,
+    count($refusedRequest),
+    'it is answered with an ERROR, because a silent consumer leaves the server waiting for a deadline '
+    . 'that then kills the worker over a configuration mistake',
+);
+Assert::same(
+    9,
+    $requestOnConsumer['frames'][array_key_last($requestOnConsumer['frames'])]['header']->requestId,
+    'correlated to the request it is refusing',
+);
 
 // A call made from inside a job handler works, which is what stops a consumer needing a cache from
 // deadlocking until its lease runs out.
