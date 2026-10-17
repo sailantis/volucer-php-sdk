@@ -1893,4 +1893,313 @@ Assert::true(
     'an empty pipeline name is refused by the client, naming the argument',
 );
 
+// ------------------------------------------------------------------------------------------------
+// Queues: the consumer side. A `JOB` frame is built by hand and a worker is run in consumer mode over
+// in-memory streams, so the assertions are about the two things an application depends on and cannot
+// discover later: what the handler was handed, and what the worker answered on its behalf.
+
+/**
+ * One `JOB` frame, as the server sends it, with an optional body.
+ *
+ * `body_len` is derived from the bytes given rather than passed, because a fixture that could disagree
+ * with itself would test the disagreement rather than the consumer.
+ *
+ * @param array<string, mixed> $overrides fields merged over the defaults, so a test can change one
+ *                                      without restating the rest — and `headers` is *replaced* rather
+ *                                      than merged, which is what lets a case send none at all
+ * @return list<array{0: int, 1: int, 2?: mixed, 3?: int}>
+ */
+function a_job(int $id = 1, string $body = '', array $overrides = []): array
+{
+    $head = [
+        'pipeline' => 'emails',
+        'id' => 'a1-0',
+        'task' => 'App\\Jobs\\SendEmail',
+        'headers' => [['traceparent', '00-abc-def-01'], ['retry-delay', '30']],
+        'attempts' => 1,
+        'body_len' => strlen($body),
+    ];
+    foreach ($overrides as $key => $value) {
+        $head[$key] = $value;
+    }
+
+    $frames = [[MessageType::JOB, $id, $head]];
+
+    if ($body !== '') {
+        $frames[] = [MessageType::BODY, $id, $body, Header::FLAG_LAST];
+    }
+
+    return $frames;
+}
+
+/**
+ * Run a worker in consumer mode over in-memory streams.
+ *
+ * @param list<array{0: int, 1: int, 2?: mixed, 3?: int}> $frames
+ * @param callable(\Volucer\Job, Worker): mixed $handler
+ * @return array{frames: list<array{header: Header, payload: string}>, raw: string, stderr: string}
+ */
+function run_consumer(array $frames, callable $handler): array
+{
+    $in = server_stream(array_merge([A_HELLO], $frames));
+    $out = sink();
+    $err = sink();
+
+    (new Worker($in, $out, $err))->consume($handler);
+
+    $raw = drained($out);
+
+    return [
+        'frames' => parse_frames($raw),
+        'raw' => $raw,
+        'stderr' => drained($err),
+    ];
+}
+
+/** The single ACK a consumer writes, decoded. */
+function the_ack(array $run): array
+{
+    $acks = json_of($run['frames'], MessageType::ACK);
+    Assert::same(1, count($acks), 'a consumer answers each job with exactly one ACK');
+
+    return $acks[0];
+}
+
+// The job reaches the handler whole: every field the server sent, and the payload as bytes.
+$seen = null;
+$acknowledged = run_consumer(a_job(1, '{"to":"a@b"}'), static function ($job, $worker) use (&$seen) {
+    $seen = $job;
+
+    return null;
+});
+$ack = the_ack($acknowledged);
+Assert::same('ack', $ack['outcome'], 'returning null acknowledges the job');
+Assert::same('emails', $seen->pipeline, 'the job knows which pipeline it came from');
+Assert::same('a1-0', $seen->id, 'the job carries the driver id the producer was told');
+Assert::same('App\\Jobs\\SendEmail', $seen->task, 'and the application task name');
+Assert::same(1, $seen->attempts, 'the first reservation reports as attempt one');
+Assert::same('{"to":"a@b"}', $seen->payload, 'the payload arrives as the exact bytes that went in');
+Assert::same(
+    ['to' => 'a@b'],
+    $seen->json(),
+    'and Job::json() decodes it, because that is the common case and not the contract',
+);
+Assert::same(
+    '00-abc-def-01',
+    $seen->header('TraceParent'),
+    'headers are looked up case-insensitively, because a producer writes traceparent and an application reads TraceParent',
+);
+Assert::same('00-abc-def-01', $seen->traceParent(), 'traceparent has a reader of its own');
+Assert::same(
+    '00-abc-def-01',
+    $seen->header('traceparent'),
+    'and the traceparent header the producer wrote is readable from the job',
+);
+Assert::true($ack['duration_us'] >= 0, 'the ACK reports how long the handler took');
+Assert::true($ack['peak_memory_bytes'] > 0, 'and the peak memory, so a pool can recycle on it');
+Assert::same(true, $ack['keep_alive'], 'a handler that does not ask to be recycled reports keep_alive');
+
+// The three outcomes, one at a time, because each is a different thing the *server* does.
+Assert::same(
+    'requeue',
+    the_ack(run_consumer(a_job(), static fn () => false))['outcome'],
+    'returning false requeues: the job is not done and should be handed out again',
+);
+$rejected = the_ack(run_consumer(
+    a_job(),
+    static fn () => 'the address is not a mailbox',
+));
+Assert::same(
+    'reject',
+    $rejected['outcome'],
+    'returning a string rejects: the job is not done and must not come back',
+);
+Assert::same(
+    'the address is not a mailbox',
+    $rejected['reason'],
+    'and the string becomes the reason the server logs',
+);
+
+// A handler that throws: requeued rather than acknowledged, because a consumer that crashed must not
+// lose the job — and the exception's message becomes the reason.
+$thrown = run_consumer(a_job(), static function () {
+    throw new RuntimeException('the database was unreachable');
+});
+$thrownAck = the_ack($thrown);
+Assert::same(
+    'requeue',
+    $thrownAck['outcome'],
+    'a throwing handler requeues rather than discarding the job',
+);
+Assert::same(
+    'the database was unreachable',
+    $thrownAck['reason'],
+    'and the exception message is what the server logs',
+);
+Assert::true(
+    str_contains($thrown['stderr'], 'the database was unreachable'),
+    'the throw is also reported on stderr, where a consumer\u2019s diagnostics go: ' . $thrown['stderr'],
+);
+
+// `recycle()` works in consumer mode too, and it is the only way an application asks to be replaced.
+$recycled = the_ack(run_consumer(a_job(), static function ($job, $worker) {
+    $worker->recycle();
+
+    return null;
+}));
+Assert::same(false, $recycled['keep_alive'], 'recycle() reports keep_alive false in the ACK');
+
+// Output is *not* a response body in consumer mode, but it must not reach the protocol channel
+// unframed either: an unbuffered write to stdout would land inside a frame and desynchronise the
+// stream. So it is captured and forwarded as a LOG, which the server renders to its own error log.
+$echoed = run_consumer(a_job(), static function () {
+    echo 'this is a debug ';
+    print 'line';
+
+    return null;
+});
+// Every byte stdout received is accounted for by a frame. A `print` that escaped the buffer would show
+// up here as bytes that belong to no frame, which is the failure this asserts against — not the text's
+// absence, because the text is *supposed* to be in a LOG payload.
+$framed = 0;
+foreach ($echoed['frames'] as $frame) {
+    $framed += Header::HEADER_LEN + $frame['header']->payloadLen;
+}
+Assert::same(
+    strlen($echoed['raw']),
+    $framed,
+    'stdout carries frames and nothing else, which is the rule the whole protocol rests on',
+);
+$escaped = array_filter(
+    $echoed['frames'],
+    static fn (array $frame): bool => $frame['header']->messageType !== MessageType::LOG
+        && str_contains($frame['payload'], 'a debug line'),
+);
+Assert::same([], $escaped, 'and the captured text appears in no frame but a LOG');
+$forwarded = json_of($echoed['frames'], MessageType::LOG);
+Assert::same(1, count($forwarded), 'it is forwarded as a LOG rather than swallowed');
+Assert::same(
+    'this is a debug line',
+    $forwarded[0]['message'] ?? null,
+    'with the text the application printed',
+);
+
+// A `JOB` with no body sends no BODY frame, so a reader that insisted on one would hang. Exactly one
+// ACK, and nothing else — the frames are filtered by type because the handshake's `HELLO_ACK` is an
+// output frame too, and a test that counted all of them would be counting the handshake.
+$empty = run_consumer(a_job(7, ''), static fn () => null);
+$emptyAcks = json_of($empty['frames'], MessageType::ACK);
+Assert::same(1, count($emptyAcks), 'a job with no body is answered with the ACK alone');
+Assert::same(
+    7,
+    $empty['frames'][array_key_last($empty['frames'])]['header']->requestId,
+    'and the ACK carries the job’s own correlation id',
+);
+Assert::same(2, count($empty['frames']), 'the whole output is the handshake and the answer');
+
+// `attempts` is the retry policy, so it has to arrive as a number an application can compare.
+$attempts = null;
+run_consumer(
+    a_job(1, '', ['attempts' => 4]),
+    static function ($job) use (&$attempts) {
+        $attempts = $job->attempts;
+
+        return 'gave up';
+    },
+);
+Assert::same(4, $attempts, 'the attempt count is what the driver recorded, not a local guess');
+
+// A job with no headers at all is normal, not an error.
+$withoutHeaders = null;
+run_consumer(
+    a_job(1, '', ['headers' => []]),
+    static function ($job) use (&$withoutHeaders) {
+        $withoutHeaders = [$job->headers, $job->header('anything'), $job->json()];
+
+        return null;
+    },
+);
+Assert::same([[], null, null], $withoutHeaders, 'a job with no headers and no payload is handled');
+
+// A malformed header pair is dropped rather than failing every job in the pipeline over one bad key.
+$malformed = null;
+run_consumer(
+    a_job(1, '', ['headers' => [['good', 'yes'], ['missing-value'], ['not-a-list'], [3, 4], ['list', ['a']]]]),
+    static function ($job) use (&$malformed) {
+        $malformed = $job->headers;
+
+        return null;
+    },
+);
+Assert::same(
+    ['good' => 'yes', 3 => '4'],
+    $malformed,
+    'a pair that is not two scalars is dropped, and a non-string one is cast rather than discarded',
+);
+
+// A worker started as a *request* worker that is handed a job: the job must be answered, not dropped,
+// because a dropped job leaves the server's poller waiting for a deadline that then kills the worker.
+$wrongMode = run_worker([A_HELLO, ...a_job(3)], static fn () => Response::text('unused'));
+$wrongAck = json_of($wrongMode['frames'], MessageType::ACK);
+Assert::same(1, count($wrongAck), 'a request worker still answers a JOB, so the poller is not left waiting');
+Assert::same(
+    'reject',
+    $wrongAck[0]['outcome'],
+    'rejected rather than requeued: the configuration is wrong, and retrying would be a loop',
+);
+Assert::true(
+    str_contains($wrongMode['stderr'], 'wrong mode'),
+    'and it says why on stderr: ' . $wrongMode['stderr'],
+);
+
+// The mirror of that: a `REQUEST` on a consumer has nowhere to go, and is named rather than guessed at.
+$requestOnConsumer = run_consumer(a_get('/', 9), static fn () => null);
+Assert::true(
+    str_contains($requestOnConsumer['stderr'], 'wrong mode'),
+    'a REQUEST on a consumer is reported as the configuration mistake it is: ' . $requestOnConsumer['stderr'],
+);
+Assert::same(
+    0,
+    count(json_of($requestOnConsumer['frames'], MessageType::RESPONSE)),
+    'and is not answered with a response, which the server would reject as a protocol error',
+);
+
+// A call made from inside a job handler works, which is what stops a consumer needing a cache from
+// deadlocking until its lease runs out.
+$callFromJob = null;
+$withCall = run_consumer(
+    [
+        // The job first, then the answer to the call it makes — the order the worker reads them in.
+        ...a_job(2),
+        // A call id counting *down* from the top, which is the direction the worker owns — the same
+        // fixture `run_kv` uses for a call made during a request. A KV value is opaque bytes on the wire
+        // and the client's default serializer is JSON, so the fixture stores `"cached"` *as JSON* inside
+        // the base64 — which is the encoding the client will look for, not a choice this test makes.
+        [MessageType::RETURN, 0xFFFFFFFF, [
+            'ok' => true,
+            'result' => ['value' => base64_encode(json_encode('cached', JSON_THROW_ON_ERROR))],
+        ]],
+    ],
+    static function ($job, $worker) use (&$callFromJob) {
+        $callFromJob = $worker->kv('sessions')->get('key');
+
+        return null;
+    },
+);
+Assert::same('cached', $callFromJob, 'a call made while handling a job is answered');
+Assert::same(
+    1,
+    count(json_of($withCall['frames'], MessageType::CALL)),
+    'and the call travels on the same channel, during the job',
+);
+
+// A clean EOF ends the consumer loop, exactly as it ends the request loop.
+$ended = run_consumer([], static fn () => null);
+Assert::same(
+    1,
+    count($ended['frames']),
+    'a clean EOF ends the consume loop after the handshake and no answer',
+);
+Assert::same(MessageType::HELLO_ACK, $ended['frames'][0]['header']->messageType, 'which is just the handshake');
+
 exit(Assert::report('worker behaviour'));

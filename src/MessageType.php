@@ -30,6 +30,8 @@ final class MessageType
     public const ERROR = 14;
     public const CALL = 15;
     public const RETURN = 16;
+    public const JOB = 17;
+    public const ACK = 18;
 
     /**
      * The wire name of a type, for diagnostics.
@@ -56,6 +58,8 @@ final class MessageType
             self::ERROR => 'ERROR',
             self::CALL => 'CALL',
             self::RETURN => 'RETURN',
+            self::JOB => 'JOB',
+            self::ACK => 'ACK',
             default => "unknown ({$type})",
         };
     }

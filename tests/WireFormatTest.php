@@ -110,7 +110,8 @@ $frozen = [
     [MessageType::RESPONSE, 4], [MessageType::BODY, 5], [MessageType::EVENT, 6],
     [MessageType::LOG, 7], [MessageType::METRIC, 8], [MessageType::CONTROL, 9],
     [MessageType::CONTROL_ACK, 10], [MessageType::END, 11], [MessageType::PING, 12],
-    [MessageType::PONG, 13], [MessageType::ERROR, 14],
+    [MessageType::PONG, 13], [MessageType::ERROR, 14], [MessageType::CALL, 15],
+    [MessageType::RETURN, 16], [MessageType::JOB, 17], [MessageType::ACK, 18],
 ];
 
 foreach ($frozen as [$type, $number]) {
@@ -118,7 +119,7 @@ foreach ($frozen as [$type, $number]) {
     Assert::same($number, ord($bytes[5]), MessageType::name($type) . ' is wire type ' . $number);
     Assert::same($number, $type, MessageType::name($type) . ' constant value is frozen');
 }
-Assert::same(14, count($frozen), 'v1 defines exactly 14 message types');
+Assert::same(18, count($frozen), 'v1 defines exactly 18 message types');
 
 // ------------------------------------------------------------- last-flag bit
 
@@ -189,12 +190,12 @@ Assert::throws(
     'protocol version',
 );
 Assert::throws(
-    static fn () => Header::decode(pack('VCCvVV', 0, 1, 17, 0, 0, 0)),
-    'type 17 is refused, because the table is 1..16',
+    static fn () => Header::decode(pack('VCCvVV', 0, 1, 19, 0, 0, 0)),
+    'type 19 is refused, because the table is 1..18',
     'unknown message type',
 );
-// 15 and 16 are CALL and RETURN, so they must *decode* rather than be refused — this is the pair that
-// would break if the whitelist were left at 14.
+// 15–18 are CALL, RETURN, JOB and ACK, so they must *decode* rather than be refused — this is the run
+// that would break if the whitelist were left at 14.
 Assert::same(
     MessageType::CALL,
     Header::decode(pack('VCCvVV', 0, 1, 15, 0, 0, 0))->messageType,
@@ -204,6 +205,16 @@ Assert::same(
     MessageType::RETURN,
     Header::decode(pack('VCCvVV', 0, 1, 16, 0, 0, 0))->messageType,
     'type 16 decodes as RETURN',
+);
+Assert::same(
+    MessageType::JOB,
+    Header::decode(pack('VCCvVV', 0, 1, 17, 0, 0, 0))->messageType,
+    'type 17 decodes as JOB',
+);
+Assert::same(
+    MessageType::ACK,
+    Header::decode(pack('VCCvVV', 0, 1, 18, 0, 0, 0))->messageType,
+    'type 18 decodes as ACK',
 );
 Assert::throws(
     static fn () => Header::decode(pack('VCCvVV', 0, 1, 0, 0, 0, 0)),

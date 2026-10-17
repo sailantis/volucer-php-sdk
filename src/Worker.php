@@ -229,6 +229,19 @@ final class Worker
     private bool $lastCallUnknown = false;
 
     /**
+     * What answers a `JOB` from the server, in consumer mode.
+     *
+     * A callable taking the decoded job and returning `null` (acknowledge), `false` (requeue) or a
+     * string (reject with that reason). Set by [`Worker::consume`], and the reason this class owns the
+     * consumer loop rather than a separate `Consumer` class: the loop needs the frame codec, the
+     * capture machinery *not* to run, and the control handler — all of which are here, and a second
+     * class would either duplicate them or reach into this one's privates.
+     *
+     * @var null|callable(Job, Worker): mixed
+     */
+    private $jobHandler = null;
+
+    /**
      * @param resource $in  the server's end: frames to read
      * @param resource $out stdout: frames to write
      * @param resource $err stderr: diagnostics, never part of the protocol
@@ -397,6 +410,17 @@ final class Worker
                     $this->serve($header, $payload, $handler);
                     break;
 
+                case MessageType::JOB:
+                    // A job on a worker that was started as a request worker. Named rather than
+                    // ignored, because the two exchanges differ in the one thing an application
+                    // cannot discover later: whether its own state is reset between units of work.
+                    $this->diagnose(
+                        'the server sent a JOB to a worker that serves requests; this worker is '
+                        . 'configured for the wrong mode, and the job is being refused'
+                    );
+                    $this->refuseJob($header, $payload);
+                    break;
+
                 case MessageType::PING:
                     $this->send(new Frame(MessageType::PONG, self::UNSOLICITED));
                     break;
@@ -423,6 +447,209 @@ final class Worker
                     );
             }
         }
+    }
+
+    /**
+     * Handshake, then handle jobs until the server closes stdin.
+     *
+     * The consumer side, and the shape an application sees is one line:
+     *
+     * ```php
+     * $worker = Worker::connect();
+     * $worker->consume(function (Job $job, Worker $worker): string|null {
+     *     return null;   // done; `fail($reason)` or `requeue()` to say otherwise
+     * });
+     * ```
+     *
+     * ## What the handler returns
+     *
+     * - `null` — **acknowledge.** The job is handled; the server removes the reservation.
+     * - a `string` — **reject**, with that string as the reason. The job is *acknowledged*, not
+     *   requeued, because a job an application has decided against is not a job that is waiting.
+     * - `false` — **requeue.** Not handled, and it should be handed out again.
+     *
+     * A `bool false` rather than a `Job::requeue()` method, because a handler that *throws* has also
+     * not handled the job and the two must not be confused: a throw means the application has a bug, a
+     * `false` means this job should be tried again. The second is a decision and the first is not.
+     *
+     * ## A throwing handler requeues, and that is the safe direction
+     *
+     * A consumer that crashes must not lose the job, and an application that wanted a crashing job
+     * *dropped* can catch its own exception and return a string — which is the visible, deliberate act
+     * this default pushes an application towards. The opposite default (acknowledge, so a poison job
+     * cannot loop for ever) is what RoadRunner's `fail()` without `requeue` does, and it silently
+     * discards work when a database is briefly unreachable; the loop it guards against is bounded by
+     * the `attempts` header the server puts on every job, which the application can read and act on.
+     *
+     * ## No response body, but output is still captured
+     *
+     * `run()` captures the application's `echo` because it becomes a response body. A job has no
+     * response body — so an application's `echo` is a *diagnostic*, and this captures it and forwards it
+     * through `emitLog` rather than leaving it on the protocol channel. That is rule 1 of this protocol
+     * and it applies here exactly as it does to a request worker: an unbuffered write to stdout lands
+     * inside a frame and desynchronises the stream for good. What differs is only where the captured
+     * bytes end up — in a `LOG` frame, which the server renders to its own error log.
+     *
+     * @param callable(Job, self): (string|false|null) $handler
+     */
+    public function consume(callable $handler): void
+    {
+        $this->jobHandler = $handler;
+        $this->handshake();
+
+        while (!$this->stopping) {
+            $header = $this->readHeader();
+
+            if ($header === null) {
+                break;
+            }
+
+            $payload = $this->readPayload($header);
+
+            switch ($header->messageType) {
+                case MessageType::JOB:
+                    $this->handleJob($header, $payload);
+                    break;
+
+                case MessageType::PING:
+                    $this->send(new Frame(MessageType::PONG, self::UNSOLICITED));
+                    break;
+
+                case MessageType::CONTROL:
+                    $this->handleControl($payload);
+                    break;
+
+                case MessageType::CALL:
+                    $this->answerCall($header, $payload);
+                    break;
+
+                case MessageType::LOG:
+                case MessageType::METRIC:
+                case MessageType::EVENT:
+                    $this->diagnose('ignoring an unexpected ' . $header->typeName() . ' from the server');
+                    break;
+
+                case MessageType::REQUEST:
+                    // The mirror of the `JOB` arm in `run()`: a request on a consumer has nowhere to
+                    // go, and answering it with a response would be a protocol error on the server —
+                    // so it is named and refused rather than guessed at.
+                    $this->diagnose(
+                        'the server sent a REQUEST to a worker that consumes jobs; this worker is '
+                        . 'configured for the wrong mode'
+                    );
+                    break;
+
+                default:
+                    throw new ProtocolException(
+                        'the server sent a ' . $header->typeName() . ', which a consumer cannot serve'
+                    );
+            }
+        }
+    }
+
+    /**
+     * Read one job, call the handler, and answer with what it decided.
+     *
+     * The whole outcome policy is the match at the bottom, and it is deliberately the only place it
+     * exists on this side — see [`Worker::consume`] for why each arm is what it is.
+     */
+    private function handleJob(Header $header, string $payload): void
+    {
+        $this->requestId = $header->requestId;
+        $this->keepAlive = true;
+
+        $metadata = $this->decodeJson($payload, 'a JOB header');
+        $body = $this->readRequestBody($header->requestId, $this->intField($metadata, 'body_len'));
+
+        $job = new Job(
+            pipeline: $this->stringField($metadata, 'pipeline'),
+            id: $this->stringField($metadata, 'id'),
+            task: $this->stringField($metadata, 'task'),
+            headers: $this->headersToMap($this->pairsField($metadata, 'headers')),
+            attempts: $this->intField($metadata, 'attempts'),
+            payload: $body,
+        );
+
+        $started = hrtime(true);
+
+        // **Captured, and then written to stderr — not left to reach stdout.** A job has no response
+        // body, so echoing is a diagnostic rather than a result, and an application's `echo` on an
+        // unbuffered write to the protocol channel would land *inside* a frame and corrupt the stream
+        // for good. That is rule 1 of this protocol, and it applies to a consumer exactly as it does to
+        // a request worker: what differs is only where the captured bytes go.
+        $this->beginCapture();
+        try {
+            /** @var mixed $result */
+            $result = ($this->jobHandler)($job, $this);
+            $outcome = match (true) {
+                $result === false => 'requeue',
+                is_string($result) => 'reject',
+                default => 'ack',
+            };
+            $reason = is_string($result) ? $result : null;
+        } catch (\Throwable $exception) {
+            $this->diagnose(sprintf(
+                'uncaught %s in job %s: %s in %s:%d',
+                $exception::class,
+                $job->id,
+                $exception->getMessage(),
+                $exception->getFile(),
+                $exception->getLine(),
+            ));
+
+            // Requeued, not acknowledged: a consumer that crashed must not lose the job. See
+            // `consume` for why this is the safe direction and what bounds the loop.
+            $outcome = 'requeue';
+            $reason = $exception->getMessage();
+        } finally {
+            $emitted = $this->endCapture();
+            if ($emitted !== '') {
+                $this->emitLog($emitted, 'info');
+            }
+        }
+
+        $answer = [
+            'outcome' => $outcome,
+            'peak_memory_bytes' => $this->peakMemoryBytes(),
+            'duration_us' => (int) ((hrtime(true) - $started) / 1000),
+            'keep_alive' => $this->keepAlive,
+        ];
+        if ($reason !== null) {
+            $answer['reason'] = $reason;
+        }
+
+        $this->sendJson(MessageType::ACK, $this->requestId, $answer);
+
+        if (!$this->keepAlive) {
+            $this->stopping = true;
+        }
+    }
+
+    /**
+     * Tell the server a job cannot be run, without running it.
+     *
+     * A worker handed a `JOB` it has no handler for — a request worker the deployment pointed at a
+     * queue — must still answer it, because a dropped job leaves the server's poller waiting until the
+     * exchange's deadline and a deadline is a kill. Rejected rather than requeued: the configuration is
+     * wrong, and handing the same job to the same misconfigured worker again is a loop rather than a
+     * retry.
+     *
+     * The body is read and discarded rather than ignored, and that is not tidiness: the frames are
+     * already on the wire, and a reader that stopped after the head would read the job's payload as the
+     * next frame header.
+     */
+    private function refuseJob(Header $header, string $payload): void
+    {
+        $metadata = $this->decodeJson($payload, 'a JOB header');
+        $this->readRequestBody($header->requestId, $this->intField($metadata, 'body_len'));
+
+        $this->sendJson(MessageType::ACK, $header->requestId, [
+            'outcome' => 'reject',
+            'reason' => 'this worker serves requests, not jobs',
+            'peak_memory_bytes' => 0,
+            'duration_us' => 0,
+            'keep_alive' => true,
+        ]);
     }
 
     /**
@@ -1152,6 +1379,42 @@ final class Worker
         }
 
         return $map;
+    }
+
+    /**
+     * A `[[name, value], …]` field, filtered to the shape it claims to be.
+     *
+     * The job header's `headers` arrive as a list of pairs, where a request's arrive as the same
+     * shape — so the parsing matches the request path's, including the one liberty it takes: a
+     * non-string name or value is *cast* rather than dropped, because a producer that wrote `3` as a
+     * header name meant `"3"` and failing every job in the pipeline over it would be a worse answer. A
+     * pair that is not two elements is dropped, which is the case a malformed frame actually produces.
+     *
+     * @param array<string, mixed> $data
+     * @return list<array{0: string, 1: string}>
+     */
+    private function pairsField(array $data, string $key): array
+    {
+        $value = $data[$key] ?? [];
+
+        if (!is_array($value)) {
+            return [];
+        }
+
+        $pairs = [];
+        /** @var mixed $pair */
+        foreach ($value as $pair) {
+            if (!is_array($pair) || count($pair) !== 2) {
+                continue;
+            }
+            $pair = array_values($pair);
+            if (!is_scalar($pair[0]) || !is_scalar($pair[1])) {
+                continue;
+            }
+            $pairs[] = [(string) $pair[0], (string) $pair[1]];
+        }
+
+        return $pairs;
     }
 
     /**
