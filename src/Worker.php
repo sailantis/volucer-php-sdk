@@ -734,6 +734,23 @@ final class Worker
         return new Lock($this);
     }
 
+    /**
+     * A handle to one of the server's queues, from the producer's side.
+     *
+     * The pipeline must be one the deployment configured; a push naming another is refused by the server
+     * with the pipelines that *are* configured, which is a better error than anything this side could
+     * produce. Note that a queue is **not** scoped per backend the way a KV storage is — the `jobs`
+     * service grants pushing to every pipeline — so the name is the only thing that selects one.
+     *
+     * Producing only: see {@see Jobs}'s class documentation for why `reserve` is not here.
+     *
+     * @param string $pipeline the name from the `[jobs.pipelines.<name>]` table.
+     */
+    public function queue(string $pipeline): Jobs
+    {
+        return new Jobs($this, $pipeline);
+    }
+
     // -------------------------------------------------------------------- calls
 
     /**

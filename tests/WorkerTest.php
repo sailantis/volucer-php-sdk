@@ -1638,4 +1638,259 @@ Assert::true(
     'an empty resource is refused by the client, naming the argument',
 );
 
+// ------------------------------------------------------------------------------------------------
+// Queues: the producer side. Two things are worth asserting here rather than in the Rust tests — that a
+// payload's bytes survive base64 exactly, and that a *partial* batch throws with the ids that made it
+// rather than reporting a total failure.
+
+/**
+ * Run one request whose handler uses a queue handle, reporting the result and the calls it sent.
+ *
+ * @param callable(\Volucer\Jobs): mixed $body
+ * @return array{result: mixed, calls: list<array{header: Header, payload: array<string, mixed>}>}
+ */
+function run_jobs(array $answers, callable $body, string $pipeline = 'emails'): array
+{
+    $in = server_stream(kv_fixture($answers));
+    $out = sink();
+    $err = sink();
+    $worker = new Worker($in, $out, $err);
+    $result = null;
+    $worker->run(static function ($request, Worker $worker) use ($body, $pipeline, &$result) {
+        $result = $body($worker->queue($pipeline));
+
+        return Response::text('ok');
+    });
+
+    $calls = [];
+    foreach (parse_frames(drained($out)) as $frame) {
+        if ($frame['header']->messageType === MessageType::CALL) {
+            $calls[] = [
+                'header' => $frame['header'],
+                'payload' => json_decode($frame['payload'], true, 512, JSON_THROW_ON_ERROR),
+                // The undecoded frame, for assertions about the *bytes* on the wire. `json_decode` with
+                // `true` turns an empty JSON object into an empty PHP array, so `{}` and `[]` are
+                // indistinguishable after a decode ? and telling them apart is exactly what one assertion
+                // here needs, because the server refuses a list where it expects a header map.
+                'raw' => $frame['payload'],
+            ];
+        }
+    }
+
+    return ['result' => $result, 'calls' => $calls];
+}
+
+$push = run_jobs(
+    [['result' => ['pushed' => true, 'id' => 'abc-0']]],
+    // Bytes above 0x7f included on purpose: a JSON string cannot carry one, which is the whole reason the
+    // payload is base64 on the wire.
+    static fn ($jobs) => $jobs->push('App\\Jobs\\SendEmail', "\x00\xff{\"to\":\"a@b\"}", ['traceparent' => '00-x-y-01']),
+);
+
+Assert::same(
+    'jobs.push',
+    $push['calls'][0]['payload']['name'] ?? null,
+    'the queue is reached through the jobs namespace',
+);
+Assert::same(
+    'emails',
+    $push['calls'][0]['payload']['params']['pipeline'] ?? null,
+    'and the pipeline goes in the params rather than in the method name, unlike a KV storage',
+);
+Assert::same(
+    'App\\Jobs\\SendEmail',
+    $push['calls'][0]['payload']['params']['task'] ?? null,
+    'the task name reaches the wire as written',
+);
+Assert::same(
+    "\x00\xff{\"to\":\"a@b\"}",
+    base64_decode($push['calls'][0]['payload']['params']['payload'] ?? '', true),
+    'and the payload is the caller\u2019s bytes, unaltered by the encoding layer',
+);
+Assert::same(
+    '00-x-y-01',
+    $push['calls'][0]['payload']['params']['headers']['traceparent'] ?? null,
+    'headers travel as strings, which is what the server stores',
+);
+Assert::same('abc-0', $push['result'], 'push answers with the id the server assigned');
+
+// An empty header map has to reach the wire as an *object*, because `json_encode([])` is `[]` and the
+// server would refuse a list where it expects a map of headers.
+$noHeaders = run_jobs(
+    [['result' => ['pushed' => true, 'id' => 'abc-1']]],
+    static fn ($jobs) => $jobs->push('App\\Jobs\\Ping'),
+);
+Assert::true(
+    str_contains($noHeaders['calls'][0]['raw'], '"headers":{}'),
+    'an empty header map reaches the wire as a JSON object rather than as an empty array, because the server refuses a list there: '
+        . $noHeaders['calls'][0]['raw'],
+);
+Assert::same(
+    '',
+    base64_decode($noHeaders['calls'][0]['payload']['params']['payload'] ?? 'x', true),
+    'and an omitted payload is an empty payload rather than an absent parameter',
+);
+
+// `jobs.pipelines` takes no arguments, and PHP cannot produce an empty object — `json_encode([])` is `[]`.
+// A no-argument call therefore has to be made without a params argument at all, which is what `ask()`
+// does. This was a real bug: the server refused `"params": []` and *every* no-argument method was
+// uncallable from PHP.
+$pipelines = run_jobs([['result' => ['pipelines' => [['name' => 'emails', 'driver' => 'memory']]]]], static fn ($jobs) => $jobs->pipelines());
+Assert::same(
+    'jobs.pipelines',
+    $pipelines['calls'][0]['payload']['name'] ?? null,
+    'the no-argument method is callable at all, which it was not before the server accepted an empty params',
+);
+Assert::same(
+    [],
+    $pipelines['calls'][0]['payload']['params'],
+    'and it is sent with no params rather than with an empty array, because PHP cannot express an empty object',
+);
+Assert::same(
+    [['name' => 'emails', 'driver' => 'memory']],
+    $pipelines['result'],
+    'the answer is the list of pipelines with their drivers',
+);
+
+$size = run_jobs(
+    [['result' => ['size' => 3, 'in_flight' => 1]]],
+    static fn ($jobs) => $jobs->size(),
+);
+Assert::same(['size' => 3, 'in_flight' => 1], $size['result'], 'size answers both numbers as one structure');
+Assert::same(
+    'jobs.size',
+    $size['calls'][0]['payload']['name'] ?? null,
+    'and it is reached through the jobs namespace',
+);
+Assert::same(
+    'emails',
+    $size['calls'][0]['payload']['params']['pipeline'] ?? null,
+    'and the pipeline is named in the params, as every jobs method does',
+);
+
+// A partial batch throws, and the exception says where it stopped and what made it — because a batch is
+// not atomic and a caller that read "false" would retry the whole thing and duplicate the pushes that
+// succeeded.
+$partial = run_jobs(
+    [['result' => ['pushed' => 2, 'ids' => ['a-0', 'a-1'], 'failed_index' => 2, 'error' => 'no pipeline named "nosuch"']]],
+    static function ($jobs) {
+        try {
+            $jobs->pushBatch([['task' => 'A'], ['task' => 'B'], ['task' => 'C']]);
+        } catch (\Volucer\ProtocolException $e) {
+            return $e->getMessage();
+        }
+
+        return null;
+    },
+)['result'];
+Assert::true(
+    is_string($partial) && str_contains($partial, 'index 2'),
+    'a partial batch names the index that failed: ' . var_export($partial, true),
+);
+Assert::true(
+    str_contains((string) $partial, 'a-0, a-1'),
+    'and the ids that were accepted, so the caller retries the tail rather than the whole batch: ' . var_export($partial, true),
+);
+Assert::true(
+    str_contains((string) $partial, 'nosuch'),
+    'and the server\u2019s reason: ' . var_export($partial, true),
+);
+
+// A batch that succeeds answers every id, and one that is empty does not call the server at all.
+$batch = run_jobs(
+    [['result' => ['pushed' => 2, 'ids' => ['b-0', 'b-1'], 'failed_index' => null]]],
+    static fn ($jobs) => $jobs->pushBatch([
+        ['task' => 'A', 'payload' => 'one'],
+        ['task' => 'B'],
+    ]),
+);
+Assert::same(['b-0', 'b-1'], $batch['result'], 'a complete batch answers every id');
+Assert::same(
+    'one',
+    base64_decode($batch['calls'][0]['payload']['params']['jobs'][0]['payload'] ?? '', true),
+    'and each job in it carries its own payload',
+);
+Assert::true(
+    str_contains($batch['calls'][0]['raw'], '"headers":{}'),
+    'with an empty header map for the job that has none: ' . $batch['calls'][0]['raw'],
+);
+
+$empty = run_jobs([], static fn ($jobs) => $jobs->pushBatch([]));
+Assert::same([], $empty['result'], 'an empty batch answers with nothing');
+Assert::same([], $empty['calls'], 'and makes no call at all, because there is nothing to ask');
+
+// A local mistake — a bad header type — is refused here rather than sent, since a round trip to learn
+// that is a round trip wasted.
+$badHeader = run_jobs([], static function ($jobs) {
+    try {
+        $jobs->push('t', '', ['attempts' => 3]);
+    } catch (\InvalidArgumentException $e) {
+        return $e->getMessage();
+    }
+
+    return null;
+})['result'];
+Assert::true(
+    is_string($badHeader) && str_contains($badHeader, 'string'),
+    'a non-string header is refused by the client, naming the rule',
+);
+
+$noTask = run_jobs([], static function ($jobs) {
+    try {
+        $jobs->push('');
+    } catch (\InvalidArgumentException $e) {
+        return $e->getMessage();
+    }
+
+    return null;
+})['result'];
+Assert::true(
+    is_string($noTask) && str_contains($noTask, 'task'),
+    'and so is a job with no task name',
+);
+
+// A refused push raises. The distinction matters here more than anywhere: a queue that silently dropped
+// work would be discovered by a customer, not by a log line.
+$refusedPush = (function () {
+    $fixture = kv_fixture([]);
+    $fixture[2] = [MessageType::RETURN, 0xFFFFFFFF, [
+        'ok' => false,
+        'error' => 'there is no pipeline named "nosuch"; this deployment has "emails"',
+    ]];
+
+    $in = server_stream($fixture);
+    $out = sink();
+    $err = sink();
+    $worker = new Worker($in, $out, $err);
+    $message = null;
+    $worker->run(static function ($request, Worker $worker) use (&$message) {
+        try {
+            $worker->queue('nosuch')->push('App\\Jobs\\X');
+        } catch (\Volucer\ProtocolException $e) {
+            $message = $e->getMessage();
+        }
+
+        return Response::text('ok');
+    });
+
+    return $message;
+})();
+Assert::true(
+    is_string($refusedPush) && str_contains($refusedPush, 'emails'),
+    'a refused push raises with the server\u2019s message, which names the pipelines that exist: ' . var_export($refusedPush, true),
+);
+
+// An empty pipeline name is refused by the client, since the server would refuse it anyway.
+$noPipeline = null;
+try {
+    $probe = new Worker(server_stream([]), sink(), sink());
+    $probe->queue('');
+} catch (\InvalidArgumentException $e) {
+    $noPipeline = $e->getMessage();
+}
+Assert::true(
+    is_string($noPipeline) && str_contains($noPipeline, 'pipeline'),
+    'an empty pipeline name is refused by the client, naming the argument',
+);
+
 exit(Assert::report('worker behaviour'));
