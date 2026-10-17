@@ -1419,4 +1419,223 @@ Assert::true(
     'and the exception carries the server\u2019s message, which names what may be reached: ' . var_export($refused, true),
 );
 
+// ------------------------------------------------------------------------------------------------
+// Locks. The fixture is the same shape: a request, then one RETURN per answer on the ids the client
+// hands out. What these assert is the boundary between the client's units and the wire's, and the
+// three outcomes an acquisition has — because two of them are easy to conflate and one of them is
+// dangerous to conflate.
+
+/**
+ * Run one request whose handler uses the lock plane, reporting the result and the calls it sent.
+ *
+ * @param callable(\Volucer\Lock): mixed $body
+ * @return array{result: mixed, calls: list<array{header: Header, payload: array<string, mixed>}>}
+ */
+function run_lock(array $answers, callable $body): array
+{
+    $in = server_stream(kv_fixture($answers));
+    $out = sink();
+    $err = sink();
+    $worker = new Worker($in, $out, $err);
+    $result = null;
+    $worker->run(static function ($request, Worker $worker) use ($body, &$result) {
+        $result = $body($worker->lock());
+
+        return Response::text('ok');
+    });
+
+    $calls = [];
+    foreach (parse_frames(drained($out)) as $frame) {
+        if ($frame['header']->messageType === MessageType::CALL) {
+            $calls[] = [
+                'header' => $frame['header'],
+                'payload' => json_decode($frame['payload'], true, 512, JSON_THROW_ON_ERROR),
+            ];
+        }
+    }
+
+    return ['result' => $result, 'calls' => $calls];
+}
+
+$acquired = run_lock(
+    [['result' => ['acquired' => true, 'id' => 'f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0', 'mode' => 'exclusive', 'remaining_ms' => null]]],
+    static fn ($lock) => $lock->acquire('pdf:create'),
+);
+
+Assert::same(
+    'lock.acquire',
+    $acquired['calls'][0]['payload']['name'] ?? null,
+    'the namespace is the whole method name: a lock is named by its resource, so there is nothing to choose',
+);
+Assert::same(
+    'pdf:create',
+    $acquired['calls'][0]['payload']['params']['resource'] ?? null,
+    'the resource goes out as written',
+);
+Assert::same(
+    0,
+    $acquired['calls'][0]['payload']['params']['ttl'] ?? null,
+    'a zero TTL goes out as zero rather than being translated into something else',
+);
+Assert::same(
+    'exclusive',
+    $acquired['calls'][0]['payload']['params']['mode'] ?? null,
+    'an exclusive acquisition says so rather than relying on the server\u2019s default',
+);
+Assert::same(
+    0,
+    $acquired['calls'][0]['payload']['params']['wait'] ?? null,
+    'and a zero wait goes out, because the server\u2019s default would be the same thing but a caller that meant "one attempt" should be able to see it',
+);
+Assert::same(
+    'f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0',
+    $acquired['result'],
+    'the id the server handed out comes back, and it is the only thing that can release the lock',
+);
+
+// ttl and wait are microseconds on the wire, so a caller writing seconds has to convert — and the
+// conversion is the client\u2019s job rather than the application\u2019s, which is what RoadRunner does too.
+$seconds = run_lock(
+    [['result' => ['acquired' => true, 'id' => 'abc', 'mode' => 'shared']]],
+    static fn ($lock) => $lock->acquireShared('report:daily', ttl: 30_000_000, wait: 2_500_000),
+);
+Assert::same(
+    30_000_000,
+    $seconds['calls'][0]['payload']['params']['ttl'] ?? null,
+    'thirty million microseconds reaches the server as thirty million, not as thirty or as thirty thousand',
+);
+Assert::same(
+    2_500_000,
+    $seconds['calls'][0]['payload']['params']['wait'] ?? null,
+    'and so does the wait',
+);
+Assert::same(
+    'shared',
+    $seconds['calls'][0]['payload']['params']['mode'] ?? null,
+    'a shared acquisition is a mode rather than a different method, so one verb serves both',
+);
+
+// Contention is an ordinary outcome: `null`, and **no exception**. A caller has to be able to tell it
+// apart from the third answer, which is why an answer that is present-but-false and an absence of an
+// answer are handled in different places.
+$contended = run_lock(
+    [['result' => ['acquired' => false, 'id' => 'generated-for-the-caller', 'mode' => null, 'remaining_ms' => null]]],
+    static fn ($lock) => $lock->tryAcquire('pdf:create'),
+);
+Assert::same(
+    null,
+    $contended['result'],
+    'a lock somebody else holds comes back as null rather than as an exception',
+);
+Assert::same(
+    'lock.try_acquire',
+    $contended['calls'][0]['payload']['name'] ?? null,
+    'and tryAcquire is its own method on the wire, so "do not wait" is not expressed as a zero deadline',
+);
+
+// `updateTtl` answering false is the opposite of contention, and both are "no": here the caller
+// *believed* it held the lock and does not, which is the case a caller has to act on.
+$renewed = run_lock(
+    [['result' => ['updated' => false, 'id' => 'gone']]],
+    static fn ($lock) => $lock->updateTtl('pdf:create', 'gone', 10_000_000),
+    // The `false` is what is asserted; the fixture is deliberately a refusal-shaped success.
+);
+Assert::same(
+    false,
+    $renewed['result'],
+    'renewing a lock the id no longer holds answers false rather than throwing',
+);
+Assert::same(
+    'lock.update_ttl',
+    $renewed['calls'][0]['payload']['name'] ?? null,
+    'and the verb the server routes on is update_ttl',
+);
+
+// The escape hatch, and the read that resolves an unknown state.
+$forced = run_lock(
+    [
+        ['result' => ['released' => true]],
+        ['result' => ['exists' => false]],
+        ['result' => ['holders' => [['id' => 'w1', 'mode' => 'shared', 'remaining_ms' => 1500]]]],
+    ],
+    static function ($lock) {
+        return [
+            'forced' => $lock->forceRelease('pdf:create'),
+            'exists' => $lock->exists('pdf:create'),
+            'holders' => $lock->holders('pdf:create'),
+        ];
+    },
+);
+Assert::same(
+    'lock.release_all',
+    $forced['calls'][0]['payload']['name'] ?? null,
+    'forceRelease is release_all on the wire, because it takes the resource from everyone',
+);
+Assert::same(true, $forced['result']['forced'], 'and reports whether it took anything');
+Assert::same(
+    'lock.exists',
+    $forced['calls'][1]['payload']['name'] ?? null,
+    'exists asks the question that resolves an unknown acquisition',
+);
+Assert::same(false, $forced['result']['exists'], 'and answers it');
+Assert::same(
+    [
+        ['id' => 'w1', 'mode' => 'shared', 'remaining_ms' => 1500],
+    ],
+    $forced['result']['holders'],
+    'holders is the full answer, so a caller can see who is inside rather than only that somebody is',
+);
+
+// A refused lock call raises, and the exception says the state is unknown and what to do about it —
+// because a client that reported this as `false` would send the caller into the section anyway.
+$refusedLock = (function () {
+    $fixture = kv_fixture([]);
+    $fixture[2] = [MessageType::RETURN, 0xFFFFFFFF, [
+        'ok' => false,
+        'error' => 'acquire on "pdf:create" left the lock state unknown: the connection dropped',
+        'unknown' => true,
+    ]];
+
+    $in = server_stream($fixture);
+    $out = sink();
+    $err = sink();
+    $worker = new Worker($in, $out, $err);
+    $message = null;
+    $worker->run(static function ($request, Worker $worker) use (&$message) {
+        try {
+            $worker->lock()->acquire('pdf:create');
+        } catch (\Volucer\ProtocolException $e) {
+            $message = $e->getMessage();
+        }
+
+        return Response::text('ok');
+    });
+
+    return ['message' => $message, 'unknown' => $worker->lastCallWasUnknown()];
+})();
+
+Assert::true(
+    is_string($refusedLock['message']) && str_contains($refusedLock['message'], 'refused'),
+    'an acquisition the server could not decide must raise rather than return null: ' . var_export($refusedLock['message'], true),
+);
+Assert::true(
+    str_contains((string) $refusedLock['message'], 'exists()'),
+    'and it must say how to resolve it, because that is the whole point of the third answer: ' . var_export($refusedLock['message'], true),
+);
+
+// An empty resource is refused here rather than sent, since the server would refuse it anyway and a
+// round trip to learn that a local mistake is a local mistake is a round trip wasted. Called directly
+// rather than through a handler: the check happens before the call, so no request is needed to reach it.
+$emptyResource = null;
+try {
+    $probe = new Worker(server_stream([]), sink(), sink());
+    $probe->lock()->acquire('');
+} catch (\InvalidArgumentException $e) {
+    $emptyResource = $e->getMessage();
+}
+Assert::true(
+    is_string($emptyResource) && str_contains($emptyResource, 'resource'),
+    'an empty resource is refused by the client, naming the argument',
+);
+
 exit(Assert::report('worker behaviour'));

@@ -717,6 +717,23 @@ final class Worker
         return new Kv($this, $storage);
     }
 
+    /**
+     * A handle to the server's resource locks.
+     *
+     * One lock plane and not one per name: a lock is named by its **resource**, so `[lock]` is a single
+     * table and a worker reaches it by putting `"lock"` in its backend's `services` list. There is
+     * nothing to choose here, which is why this takes no argument where {@see Worker::kv()} takes a
+     * storage name.
+     *
+     * Returns a fresh handle each call, like `kv()`, and for a smaller reason: the object holds no
+     * state at all, so sharing one would be harmless — but a caller that mutated a shared one later
+     * would be a surprise, and constructing it costs nothing.
+     */
+    public function lock(): Lock
+    {
+        return new Lock($this);
+    }
+
     // -------------------------------------------------------------------- calls
 
     /**
