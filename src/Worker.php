@@ -948,6 +948,15 @@ final class Worker
 
     /**
      * Emit a metric sample without touching stdout.
+     *
+     * **The name must be a Prometheus metric name** — `[a-zA-Z_][a-zA-Z0-9_]*` — because that is
+     * what it becomes. A dot is not allowed: it is illegal in the exposition format (Prometheus uses
+     * a dot for its own `recording.rule` vocabulary), and a name carrying one arrives, is counted as
+     * refused, and never appears — so a dot here is a sample that silently does nothing.
+     *
+     * The name also has to be declared by the deployment in `[metrics.collect]` before it is
+     * accepted; see `docs/plugins.md` §6.1. A server refuses an undeclared name on purpose, so that
+     * an application cannot widen the published set at runtime.
      */
     public function emitMetric(string $name, float $value, string $unit = ''): void
     {
@@ -1404,7 +1413,7 @@ final class Worker
                 break;
 
             case 'report':
-                $this->emitMetric('worker.peak_memory_bytes', (float) $this->peakMemoryBytes(), 'bytes');
+                $this->emitMetric('worker_peak_memory_bytes', (float) $this->peakMemoryBytes(), 'bytes');
                 break;
 
             case 'reload':

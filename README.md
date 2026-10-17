@@ -103,7 +103,7 @@ request does not take the worker down.
 ```php
 Worker::create()->run(function (Request $request, Worker $worker): ?Response {
     // Telemetry never touches the response.
-    $worker->emitMetric('request.count', 1.0, 'count');
+    $worker->emitMetric('request_count', 1.0, 'count');
     $worker->emitLog("serving {$request->uri}");
 
     if ($request->uri === '/health') {
@@ -151,7 +151,7 @@ $response->withStatus(201)->withHeader('X-Trace', 'abc')->withBody('…');
 | `Worker::connect()` | `create()`, but honour `VOLUCER_WORKER_SOCKET` when the server sets it |
 | `run($handler)` | handshake, then serve until EOF |
 | `emitLog($message, $level)` | one log record, unsolicited |
-| `emitMetric($name, $value, $unit)` | one metric sample, unsolicited |
+| `emitMetric($name, $value, $unit)` | one metric sample, unsolicited. `$name` must be a Prometheus name (`[a-zA-Z_][a-zA-Z0-9_]*`) and declared in the server's `[metrics.collect]` |
 | `recycle()` | ask the server to replace this worker after the request |
 | `currentRequestId()` | the in-flight request id, for telemetry correlation |
 

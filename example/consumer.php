@@ -64,7 +64,7 @@ $worker->consume(static function (Job $job, Worker $worker): string|bool|null {
     switch ($job->task) {
         case 'App\\Jobs\\SendEmail':
             $payload = $job->json() ?? [];
-            $worker->emitMetric('example.jobs.sent', 1.0, 'count');
+            $worker->emitMetric('example_jobs_sent_total', 1.0, 'count');
             $worker->emitLog('would send to ' . ($payload['to'] ?? '(nobody)'));
 
             return null;

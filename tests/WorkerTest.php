@@ -647,7 +647,7 @@ $reported = run_worker(
 );
 $reportedMetrics = json_of($reported['frames'], MessageType::METRIC);
 Assert::same(1, count($reportedMetrics), 'a report answers with one metric');
-Assert::same('worker.peak_memory_bytes', $reportedMetrics[0]['name'], 'the report names its metric');
+Assert::same('worker_peak_memory_bytes', $reportedMetrics[0]['name'], 'the report names its metric');
 
 // ------------------------------------------------------------- stream errors
 
@@ -721,7 +721,7 @@ $telemetry = run_worker(
     array_merge([A_HELLO], a_get('/log')),
     static function (Request $request, Worker $worker): Response {
         $worker->emitLog('hello from the handler');
-        $worker->emitMetric('handler.count', 1.0, 'count');
+        $worker->emitMetric('handler_count', 1.0, 'count');
 
         return Response::text('ok');
     },

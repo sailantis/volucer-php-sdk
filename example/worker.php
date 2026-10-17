@@ -71,7 +71,10 @@ $worker->run(static function (Request $request, Worker $worker): Response|null {
     }
 
     // Telemetry travels on its own channel, so it never touches the response.
-    $worker->emitMetric('example.request', 1.0, 'count');
+    // Telemetry travels on its own channel, so it never touches the response. The name is a
+    // Prometheus one -- letters, digits and underscores -- because that is what it becomes; a dot
+    // would be refused by the server and the sample would silently do nothing.
+    $worker->emitMetric('example_request_total', 1.0, 'count');
     $worker->emitLog("serving {$request->method} {$request->uri}");
 
     // Echo case: print something and return null. The captured output becomes
