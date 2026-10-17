@@ -242,6 +242,28 @@ final class Worker
     private $jobHandler = null;
 
     /**
+     * What answers a `REQUEST` while this worker is serving gRPC, in gRPC mode.
+     *
+     * Set by [`Worker::grpc`], and held for the same reason `jobHandler` is rather than being passed
+     * down through `run`: the loop that reads frames is this class's, and a mode that had to thread a
+     * handler through the request path would make every other mode's signature carry it.
+     *
+     * @var null|callable(Request, Worker): mixed
+     */
+    private $grpcHandler = null;
+
+    /**
+     * What answers a `REQUEST` that is *not* a gRPC call, in `run()` mode.
+     *
+     * Set by [`Worker::run`]. A field rather than a parameter of the serve path, for the same reason
+     * `jobHandler` is: the loop that reads frames is this class's, and the request path now has two
+     * handlers — one per protocol — so the one that used to arrive as an argument could not stay one.
+     *
+     * @var null|callable(Request, Worker): mixed
+     */
+    private $httpHandler = null;
+
+    /**
      * @param resource $in  the server's end: frames to read
      * @param resource $out stdout: frames to write
      * @param resource $err stderr: diagnostics, never part of the protocol
@@ -392,6 +414,8 @@ final class Worker
      */
     public function run(callable $handler): void
     {
+        $this->httpHandler = $handler;
+
         $this->handshake();
 
         while (!$this->stopping) {
@@ -407,7 +431,7 @@ final class Worker
 
             switch ($header->messageType) {
                 case MessageType::REQUEST:
-                    $this->serve($header, $payload, $handler);
+                    $this->serve($header, $payload);
                     break;
 
                 case MessageType::JOB:
@@ -665,9 +689,12 @@ final class Worker
     /**
      * Serve one request: read its body, call the handler, write the response.
      *
-     * @param callable(Request, self): (Response|string|null) $handler
+     * **One method for both protocols**, because one worker answers both. The HTTP handler is the field
+     * `run()` set, the gRPC handler is the field `onGrpc()` set, and which one a request reaches is
+     * decided by its content type — see [`Worker::onGrpc`] for why that, rather than how the process was
+     * started, is the right question to ask.
      */
-    private function serve(Header $header, string $payload, callable $handler): void
+    private function serve(Header $header, string $payload): void
     {
         $this->requestId = $header->requestId;
         $this->keepAlive = true;
@@ -676,13 +703,29 @@ final class Worker
         $body = $this->readRequestBody($header->requestId, $this->intField($metadata, 'body_len'));
 
         $started = hrtime(true);
+        // Capture is started before either arm and is *discarded* by the gRPC one: `echo` cannot become a
+        // gRPC message, because the reply is a framed message in a trailer-carrying body. Starting it
+        // here rather than inside the HTTP arm means the `$request` both arms see is built in the same
+        // protected scope, with one place that opens it.
         $this->beginCapture();
 
         try {
             $request = $this->buildRequest($metadata, $body);
-            $result = $handler($request, $this);
-            $captured = $this->endCapture();
-            $response = $this->normalise($result, $captured);
+
+            if ($request->isGrpc()) {
+                $response = $this->answerGrpc($request, $started);
+            } else {
+                $handler = $this->httpHandler;
+                if ($handler === null) {
+                    throw new ProtocolException(
+                        'an HTTP request arrived at a worker that registered no HTTP handler; call '
+                        . 'Worker::run() or Worker::onGrpc()'
+                    );
+                }
+                $result = $handler($request, $this);
+                $captured = $this->endCapture();
+                $response = $this->normalise($result, $captured);
+            }
             $appStatus = 0;
         } catch (\Throwable $exception) {
             // The handler left its buffer open or unwound ours, so recover
@@ -697,13 +740,109 @@ final class Worker
                 $exception->getLine(),
             ));
 
-            $response = Response::text("Internal Server Error\n", 500);
+            // A gRPC failure has to be reported the way gRPC reports one, and this is the SDK's half of
+            // that: an HTTP error status is unreadable to a gRPC client, which reads the outcome from
+            // the trailer section. So a broken handler on a call becomes `INTERNAL` in the trailers
+            // rather than a 500 the client cannot interpret. The diagnostic above still says what
+            // actually happened, which the status cannot.
+            //
+            // `isGrpc()` is re-derived rather than remembered, because the failure may have happened
+            // while *building* the request — before there is a variable holding it.
+            $response = $this->looksLikeGrpc($metadata)
+                ? $this->grpcResponse(
+                    GrpcResponse::fail(GrpcResponse::INTERNAL, 'the application failed while serving this call'),
+                    (int) ((hrtime(true) - $started) / 1000),
+                )
+                : Response::text("Internal Server Error\n", 500);
             $appStatus = 1;
         }
 
         $durationUs = (int) ((hrtime(true) - $started) / 1000);
 
         $this->respond($response, $appStatus, $durationUs);
+    }
+
+    /**
+     * Answer one gRPC call with the registered handler, or say `UNIMPLEMENTED` if there is none.
+     *
+     * Held separately from the loop in [`Worker::serve`] rather than inlined, because that method has a
+     * `catch` that both protocols share and this is the half that has to be readable on its own: every
+     * branch here turns into a status a client reads.
+     */
+    private function answerGrpc(Request $request, int $started): Response
+    {
+        $handler = $this->grpcHandler;
+        if ($handler === null) {
+            // Not an error, and not a 500: a call that arrived at a worker with no gRPC handler is
+            // exactly what gRPC's `UNIMPLEMENTED` means, and the client is entitled to treat it as
+            // final rather than to retry it. The capture started by `serve` covers the request that was
+            // just read and is discarded here.
+            $this->endCapture();
+
+            return $this->grpcResponse(
+                GrpcResponse::fail(
+                    GrpcResponse::UNIMPLEMENTED,
+                    'this worker registered no gRPC handler; call Worker::onGrpc()',
+                ),
+                (int) ((hrtime(true) - $started) / 1000),
+            );
+        }
+
+        try {
+            $answer = $handler($request, $this);
+        } catch (\Throwable $exception) {
+            // A thrown handler is a bug in the application, and gRPC has a code for exactly that. The
+            // exception is *reported* rather than swallowed: it is the only record of what went wrong,
+            // and `INTERNAL` says nothing about it.
+            $this->diagnose(sprintf(
+                'uncaught %s while serving %s: %s in %s:%d',
+                $exception::class,
+                $request->uri,
+                $exception->getMessage(),
+                $exception->getFile(),
+                $exception->getLine(),
+            ));
+
+            $answer = GrpcResponse::fail(
+                GrpcResponse::INTERNAL,
+                'the application failed while serving this call',
+            );
+        }
+
+        $this->endCapture();
+
+        return $this->grpcResponse($answer, (int) ((hrtime(true) - $started) / 1000));
+    }
+
+    /**
+     * Whether a REQUEST's metadata describes a gRPC call, without building a [`Request`] first.
+     *
+     * Needed because the failure path in [`Worker::serve`] has to know which *kind* of reply to produce
+     * while the thing that normally answers that — a built `Request` — may be exactly what failed to be
+     * built. The rule is [`Request::isGrpc`]'s, reached from the raw metadata; the two are the same
+     * question and the header is the only thing either asks about.
+     *
+     * @param array<string, mixed> $metadata
+     */
+    private function looksLikeGrpc(array $metadata): bool
+    {
+        if (!isset($metadata['headers']) || !is_array($metadata['headers'])) {
+            return false;
+        }
+
+        foreach ($metadata['headers'] as $pair) {
+            if (is_array($pair) && count($pair) === 2 && strcasecmp((string) $pair[0], 'content-type') === 0) {
+                $type = strtolower(trim((string) $pair[1]));
+                if (!str_starts_with($type, 'application/grpc')) {
+                    return false;
+                }
+                $rest = substr($type, strlen('application/grpc'));
+
+                return $rest === '' || $rest[0] === ';' || $rest[0] === '+' || $rest[0] === '-';
+            }
+        }
+
+        return false;
     }
 
     /**
@@ -1448,6 +1587,124 @@ final class Worker
         throw new ProtocolException(
             'a worker handler must return a Response, a string or null, got ' . get_debug_type($result)
         );
+    }
+
+    /**
+     * Register the handler for gRPC calls, then serve everything until the server closes stdin.
+     *
+     * The other half of `run()`, and the reason it is a second method rather than a mode of the
+     * first: a gRPC call is not an HTML request that happens to have an unusual content type. Its
+     * outcome travels in the **trailer section** of the reply rather than in the HTTP status, the
+     * request body is length-delimited framed messages rather than a form, and an unhandled method is
+     * a normal answer (`UNIMPLEMENTED`) rather than an error. An application that tried to serve both
+     * with one handler would have to ask which it was on every request.
+     *
+     * **Which calls count as gRPC is decided by `content-type`, not by having called this method.** A
+     * worker that serves both HTTP routes and gRPC services — which is the ordinary shape, because one
+     * pool is one backend — has one process answering both, and so does a worker that called `run()`
+     * and then `grpc()`. What this method decides is *who answers a call*: without it, a call is
+     * answered `UNIMPLEMENTED` by the SDK. Whether a call may arrive at all is the server's decision,
+     * through `grpc_services` on the backend; a service that is not listed never reaches a worker.
+     *
+     * ```php
+     * $worker = Worker::connect();
+     * $worker->onGrpc(function (Request $request, Worker $worker): GrpcResponse {
+     *     return match ($request->grpcCalledMethod()) {
+     *         'SayHello' => GrpcResponse::message(encode_reply('hello')),
+     *         default    => GrpcResponse::fail(GrpcResponse::UNIMPLEMENTED, 'no such method'),
+     *     };
+     * });
+     * $worker->run(function (Request $request, Worker $worker): Response {
+     *     return Response::json(['route' => $request->uri]);      // the HTTP half, too
+     * });
+     * ```
+     *
+     * The handler receives the [`Request`] — so it has the method path, the metadata and the raw
+     * message bytes — and returns a [`GrpcResponse`], a `string` (bytes that are sent as-is, which is
+     * the shape a handler that only builds a message needs), or `null`, meaning an empty message.
+     *
+     * **This is *not* the direction `Worker::call()` uses.** That one is the application asking the
+     * *server* for something mid-request (`kv.get`, `lock.acquire`); this one is the server delivering
+     * a unit of work. They share the channel and nothing else, and `docs/plugins.md` §4.3 is where the
+     * distinction is written down.
+     *
+     * @param callable(Request, self): (GrpcResponse|string|null) $handler
+     */
+    public function onGrpc(callable $handler): void
+    {
+        $this->grpcHandler = $handler;
+    }
+
+    /**
+     * Register the handler for gRPC calls **and** serve them, with no HTTP routes.
+     *
+     * The convenience for a worker that only speaks gRPC — `onGrpc()` followed by `run()`, where the
+     * HTTP handler is one that says by name that it has no routes rather than leaving the caller to
+     * invent it. A worker that serves both calls the two halves separately; see [`Worker::onGrpc`].
+     *
+     * @param callable(Request, self): (GrpcResponse|string|null) $handler
+     */
+    public function grpc(callable $handler): void
+    {
+        $this->onGrpc($handler);
+
+        $this->run(static fn (Request $request): Response => Response::text(
+            "this worker serves gRPC calls; an HTTP request reached it because its backend has no\n"
+            . "HTTP route and this process has no HTTP handler\n",
+            404,
+        ));
+    }
+
+    /**
+     * Turn whatever a gRPC handler returned into the [`Response`] the protocol carries.
+     *
+     * The translation is one step and it is the whole of how gRPC's outcome reaches the wire: the
+     * status and the message become two *response headers*, and the server moves them into the trailer
+     * section — because the worker protocol's `RESPONSE` head has nowhere else to put them, and because
+     * the server is the side that knows gRPC's framing. Nothing else about the call is special.
+     *
+     * `Content-Type: application/grpc` is set here rather than left to the application: a gRPC client
+     * refuses a reply that does not carry it before it reads a byte of the body, so a handler that
+     * forgot would see its message rejected for a reason it could not discover from the answer.
+     *
+     * `grpc-status: 0` with no message is the success case, and the absence of a message is a `0`-length
+     * *body* rather than a `0`-length message — gRPC's own convention, and the client reads the same
+     * thing either way.
+     */
+    private function grpcResponse(mixed $answer, int $durationUs): Response
+    {
+        if ($answer === null) {
+            $answer = GrpcResponse::ok();
+        } elseif (is_string($answer)) {
+            $answer = GrpcResponse::message($answer);
+        }
+
+        if (!$answer instanceof GrpcResponse) {
+            // A `ProtocolException` rather than a 500, because it is not the *call* that failed — the
+            // application did not answer it at all. `serve()` turns a thrown exception into a status
+            // and a log line, which is the honest outcome for a handler that is broken.
+            throw new ProtocolException(
+                'a gRPC handler must return a GrpcResponse, a string or null, got '
+                . get_debug_type($answer)
+            );
+        }
+
+        $response = new Response(
+            status: 200,
+            headers: [
+                ['Content-Type', $answer->contentType],
+                ['grpc-status', (string) $answer->status],
+            ],
+            body: $answer->payload,
+        );
+
+        // Only when there is one. An empty `grpc-message` and an absent one mean the same thing to a
+        // client, and only one of them is true of a call that has nothing to say.
+        if ($answer->reason !== '') {
+            $response->headers[] = ['grpc-message', $answer->reason];
+        }
+
+        return $response;
     }
 
     // ----------------------------------------------------------- output capture

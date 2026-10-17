@@ -34,6 +34,34 @@ use Volucer\Worker;
 // server chose and hang waiting for input that is now arriving on a socket.
 $worker = Worker::connect();
 
+// The gRPC half, registered before the loop starts. A call is identified by its *content type*, so one
+// process serves both protocols and this only decides who answers a call — see `Worker::onGrpc`.
+//
+// The server never parses a message (`docs/plugins.md` §6.6), so this handler frames its own reply:
+// gRPC's message framing is one compression flag byte, a big-endian `u32` length, then that many bytes.
+// A real application would let a protobuf library write that; here it is written out so the test has
+// something to assert on and so the framing is visible.
+$worker->onGrpc(static function (Request $request, Worker $worker): \Volucer\GrpcResponse {
+    $method = $request->grpcCalledMethod();
+
+    // An unlisted method is a normal answer, not an error: it is what the application says when it
+    // does not implement something the server was told it might.
+    if ($method !== 'SayHello') {
+        return \Volucer\GrpcResponse::fail(
+            \Volucer\GrpcResponse::UNIMPLEMENTED,
+            "no method {$method} on this service",
+        );
+    }
+
+    // The message, framed. `$request->body` is the raw framed bytes the client sent — nothing here
+    // parses them, because the server does not either.
+    $payload = "hello from volucer's gRPC handler\n";
+
+    return \Volucer\GrpcResponse::message(
+        "\x00" . pack('N', strlen($payload)) . $payload,
+    );
+});
+
 $worker->run(static function (Request $request, Worker $worker): Response|null {
     $path = (string) parse_url($request->uri, PHP_URL_PATH);
 
