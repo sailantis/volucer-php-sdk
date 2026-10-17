@@ -1105,4 +1105,318 @@ Assert::same(
     'the interrupted request still ended normally',
 );
 
+/**
+ * `Worker::kv()`: the encoding the client does, and the answers it reads back.
+ *
+ * The KV client is thin and `Worker::call` is tested above; what is under test here is the *encoding* —
+ * a value is serialized and base64-encoded on this side, the key the same way, and a result decoded back
+ * into whatever went in — plus the three-state answers, which are the parts a caller cannot see from the
+ * method signature.
+ *
+ * The fixture cannot read while the worker writes, so every answer is written ahead of time on the ids
+ * the client will use: `0xFFFFFFFF` for its first call and counting down. That is also what makes this a
+ * test of the client rather than of the fixture.
+ */
+function kv_fixture(array $answers): array
+{
+    $frames = [
+        A_HELLO,
+        [MessageType::REQUEST, 1, [
+            'method' => 'GET',
+            'uri' => '/',
+            'protocol' => 'HTTP/1.1',
+            'headers' => [],
+            'remote_addr' => '127.0.0.1',
+            'body_len' => 0,
+            'script_filename' => '/index.php',
+            'https' => false,
+        ]],
+    ];
+    // One RETURN per answer, on the ids the client's own counter will hand out.
+    foreach ($answers as $index => $answer) {
+        $frames[] = [MessageType::RETURN, 0xFFFFFFFF - $index, ['ok' => true] + $answer];
+    }
+
+    return $frames;
+}
+
+/**
+ * Run one request whose handler uses a `Kv` handle, and report what it saw and what it sent.
+ *
+ * @param callable(\Volucer\Kv): mixed $body
+ * @return array{result: mixed, calls: list<array{header: Header, payload: array<string, mixed>}>}
+ */
+function run_kv(array $answers, callable $body, string $storage = 'sessions'): array
+{
+    $in = server_stream(kv_fixture($answers));
+    $out = sink();
+    $err = sink();
+    $worker = new Worker($in, $out, $err);
+    $result = null;
+    $worker->run(static function ($request, Worker $worker) use ($body, $storage, &$result) {
+        $result = $body($worker->kv($storage));
+
+        return Response::text('ok');
+    });
+
+    $calls = [];
+    foreach (parse_frames(drained($out)) as $frame) {
+        if ($frame['header']->messageType === MessageType::CALL) {
+            $calls[] = [
+                'header' => $frame['header'],
+                'payload' => json_decode($frame['payload'], true, 512, JSON_THROW_ON_ERROR),
+            ];
+        }
+    }
+
+    return ['result' => $result, 'calls' => $calls];
+}
+
+// ------------------------------------------------------------------------------------------------
+// A value goes in, comes back, and is the same value — asserted on the bytes that crossed the wire as
+// well as on the result, because a client that encoded correctly and decoded wrongly would pass a test
+// that only compared the handler's return value against the fixture's echo.
+
+$roundtrip = run_kv(
+    [
+        // One answer per call: the `set` then the `get`. The first is consumed and ignored — `set` reads
+        // only `stored` from it — which is also what makes the assertion below about the *second* answer
+        // rather than about a fixture that echoed whatever it was given.
+        ['result' => ['stored' => true]],
+        ['result' => ['value' => base64_encode('{"hello":"world"}')]],
+    ],
+    static function ($kv) {
+        $kv->set('greeting', ['hello' => 'world']);
+
+        return $kv->get('greeting');
+    },
+);
+
+Assert::same(
+    'kv.sessions.set',
+    $roundtrip['calls'][0]['payload']['name'] ?? null,
+    'the storage is part of the method name, because the server routes on it',
+);
+Assert::same(
+    'greeting',
+    base64_decode($roundtrip['calls'][0]['payload']['params']['key'] ?? '', true),
+    'the key reached the wire as the caller wrote it, through the same base64 as a value',
+);
+Assert::same(
+    '{"hello":"world"}',
+    base64_decode($roundtrip['calls'][0]['payload']['params']['value'] ?? '', true),
+    'and the value is the default serializer\u2019s JSON, unaltered by the encoding layer',
+);
+Assert::same(
+    ['hello' => 'world'],
+    $roundtrip['result'],
+    'the answer decodes back into the array that went in',
+);
+
+// ------------------------------------------------------------------------------------------------
+// A stored `null` is not the same as a key that was never written — the distinction PSR-16's `get`
+// cannot make, and the reason `Kv::get` takes a `$found` reference rather than returning null for both.
+
+$nulls = run_kv(
+    [
+        ['result' => ['value' => base64_encode('null')]],
+        ['result' => ['value' => null]],
+    ],
+    static function ($kv) {
+        $stored = $kv->get('stored-null', $present);
+        $absent = $kv->get('never-written', $missing);
+
+        return ['stored' => $stored, 'present' => $present, 'absent' => $absent, 'missing' => $missing];
+    },
+);
+
+Assert::same(
+    ['stored' => null, 'present' => true, 'absent' => null, 'missing' => false],
+    $nulls['result'],
+    'a stored null reports itself present and an unwritten key does not, even though both are null',
+);
+
+// ------------------------------------------------------------------------------------------------
+// The three-state TTL, which must not collapse into one number: a client comparing `seconds > 0` would
+// read "never expires" as "expired".
+
+$ttls = run_kv(
+    [
+        ['result' => ['ttl' => 'missing']],
+        ['result' => ['ttl' => 'forever']],
+        ['result' => ['ttl' => 60]],
+    ],
+    static fn ($kv) => [
+        'missing' => $kv->ttl('never-written'),
+        'forever' => $kv->ttl('forever'),
+        'soon' => $kv->ttl('soon'),
+    ],
+);
+
+Assert::same(
+    ['missing' => 'missing', 'forever' => 'forever', 'soon' => 60],
+    $ttls['result'],
+    'each of the three answers arrives as its own thing',
+);
+
+// ------------------------------------------------------------------------------------------------
+// A zero TTL means delete, and is sent as a delete rather than as a `set` with a count the wire cannot
+// carry — PSR-16: "a negative or zero TTL MUST cause the item to be deleted".
+
+foreach ([0, -1] as $ttl) {
+    $zero = run_kv([], static function ($kv) use ($ttl) {
+        $kv->set('key', 'value', $ttl);
+
+        return null;
+    });
+
+    Assert::same(
+        'kv.sessions.delete',
+        $zero['calls'][0]['payload']['name'] ?? null,
+        "a TTL of {$ttl} must become a delete",
+    );
+}
+
+// And no TTL at all omits the parameter rather than sending a zero, which would be a delete.
+$forever = run_kv([], static function ($kv) {
+    $kv->set('key', 'value');
+
+    return null;
+});
+
+Assert::same(
+    false,
+    array_key_exists('ttl', $forever['calls'][0]['payload']['params'] ?? []),
+    'omitting the TTL must omit the parameter, not send a zero that the server would read as a delete',
+);
+
+// ------------------------------------------------------------------------------------------------
+// The serializer is replaceable, which is the reason the server carries opaque bytes rather than PHP
+// values. Asserted on the bytes, because that is what proves the server never sees a structured value.
+
+$serialized = run_kv([['result' => ['value' => base64_encode('serialized-bytes')]]], static function ($kv) {
+    $kv->serializer(serialize(...), unserialize(...));
+    $kv->set('object', new ArrayObject(['a' => 1]));
+
+    return null;
+});
+
+$bytes = base64_decode($serialized['calls'][0]['payload']['params']['value'] ?? '', true) ?: '';
+Assert::true(
+    str_contains($bytes, 'ArrayObject'),
+    'the serialized form is PHP\u2019s own and not JSON: ' . var_export($bytes, true),
+);
+
+// ------------------------------------------------------------------------------------------------
+// A batch keeps its positions, including the holes: a version that dropped absent keys would make the
+// third answer belong to the second key, which is how a batch API silently returns the wrong data.
+
+$batch = run_kv(
+    [
+        ['result' => ['stored' => 2]],
+        ['result' => ['values' => [base64_encode('1'), null, base64_encode('3')]]],
+    ],
+    static function ($kv) {
+        $kv->setMultiple(['a' => 1, 'c' => 3]);
+
+        return $kv->getMany(['a', 'missing', 'c']);
+    },
+);
+
+Assert::same(
+    [1, null, 3],
+    $batch['result'],
+    'the absent key is a hole in its own position',
+);
+Assert::same(
+    'kv.sessions.setMultiple',
+    $batch['calls'][0]['payload']['name'] ?? null,
+    'and the write was one call rather than one per key',
+);
+Assert::same(
+    2,
+    count($batch['calls'][0]['payload']['params']['values'] ?? []),
+    'carrying both values',
+);
+
+// `getMultiple` names what was missing, because a stored null is a value and cannot be distinguished
+// from an absence by a keyed array alone.
+$separated = run_kv(
+    [['result' => ['values' => [base64_encode('1'), null]]]],
+    static function ($kv) {
+        $missing = null;
+        $found = $kv->getMultiple(['a', 'b'], $missing);
+
+        return ['found' => $found, 'missing' => $missing];
+    },
+);
+
+Assert::same(
+    ['a' => 1],
+    $separated['result']['found'],
+    'only the keys with values are in the answer',
+);
+Assert::same(
+    ['b'],
+    $separated['result']['missing'],
+    'and the ones without are named, rather than being indistinguishable from a value of null',
+);
+
+// ------------------------------------------------------------------------------------------------
+// An empty key is refused here rather than at the server: this side can refuse it before a round trip,
+// and its message can say which argument was wrong.
+
+$empty = run_kv([], static function ($kv) {
+    return $kv->get('');
+});
+
+Assert::same([], $empty['calls'], 'an empty key must not reach the wire');
+
+// ------------------------------------------------------------------------------------------------
+// A **refused** call raises rather than looking like a cache miss.
+//
+// The failure this prevents is the one an application is least able to notice: an ungranted storage, a
+// malformed key or a full store leaves `Worker::call` returning null with the reason in `lastCallError`,
+// and a client that ignored that would report "not cached" for every read — re-deriving everything on
+// every request and looking healthy while doing it. That is the exact failure a cache is deployed to
+// prevent, arriving without a log line.
+//
+// The fixture answers with the server's own shape for a refusal: `ok: false` and an error string.
+
+$fixture = kv_fixture([]);
+// Replace the first canned answer with a refusal, which is what the server sends for an ungranted
+// storage — see `KvNamespace::resolve` for the message.
+$fixture[2] = [MessageType::RETURN, 0xFFFFFFFF, [
+    'ok' => false,
+    'error' => 'this backend\'s windows may not reach the "secrets" storage; it may reach "sessions"',
+]];
+
+$refused = (function () use ($fixture) {
+    $in = server_stream($fixture);
+    $out = sink();
+    $err = sink();
+    $worker = new Worker($in, $out, $err);
+    $message = null;
+    $worker->run(static function ($request, Worker $worker) use (&$message) {
+        try {
+            $worker->kv('secrets')->get('key');
+        } catch (\Volucer\ProtocolException $e) {
+            $message = $e->getMessage();
+        }
+
+        return Response::text('ok');
+    });
+
+    return $message;
+})();
+
+Assert::true(
+    is_string($refused) && str_contains($refused, 'refused'),
+    'a refused call must raise rather than return a value that reads as a cache miss',
+);
+Assert::true(
+    str_contains((string) $refused, 'sessions'),
+    'and the exception carries the server\u2019s message, which names what may be reached: ' . var_export($refused, true),
+);
+
 exit(Assert::report('worker behaviour'));

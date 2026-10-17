@@ -699,6 +699,24 @@ final class Worker
         return $this->requestId;
     }
 
+    /**
+     * A handle to one of the server's key-value storages.
+     *
+     * The storage must be one this worker's backend was granted in its `services` list; a call naming
+     * another is refused by the server with the storages that *are* reachable, which is a better error
+     * than anything this side could produce.
+     *
+     * Returns a new handle each time rather than memoizing one, because the serializer is per-instance:
+     * two parts of an application can legitimately want different encodings of the same storage, and a
+     * shared handle would make the second `serializer()` call silently change the first one's behaviour.
+     *
+     * @param string $storage the name from the `[kv.<name>]` table.
+     */
+    public function kv(string $storage = 'default'): Kv
+    {
+        return new Kv($this, $storage);
+    }
+
     // -------------------------------------------------------------------- calls
 
     /**
