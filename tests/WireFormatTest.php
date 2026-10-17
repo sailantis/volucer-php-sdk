@@ -189,9 +189,21 @@ Assert::throws(
     'protocol version',
 );
 Assert::throws(
-    static fn () => Header::decode(pack('VCCvVV', 0, 1, 15, 0, 0, 0)),
-    'type 15 is refused (v1 defines 1..14)',
+    static fn () => Header::decode(pack('VCCvVV', 0, 1, 17, 0, 0, 0)),
+    'type 17 is refused, because the table is 1..16',
     'unknown message type',
+);
+// 15 and 16 are CALL and RETURN, so they must *decode* rather than be refused — this is the pair that
+// would break if the whitelist were left at 14.
+Assert::same(
+    MessageType::CALL,
+    Header::decode(pack('VCCvVV', 0, 1, 15, 0, 0, 0))->messageType,
+    'type 15 decodes as CALL',
+);
+Assert::same(
+    MessageType::RETURN,
+    Header::decode(pack('VCCvVV', 0, 1, 16, 0, 0, 0))->messageType,
+    'type 16 decodes as RETURN',
 );
 Assert::throws(
     static fn () => Header::decode(pack('VCCvVV', 0, 1, 0, 0, 0, 0)),

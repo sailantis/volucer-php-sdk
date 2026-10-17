@@ -193,6 +193,21 @@ final class Worker
     private bool $checksum = true;
 
     /**
+     * What answers a `CALL` from the server.
+     *
+     * A callable taking the decoded call as an array — `name`, `params` — and returning either a
+     * value to send as the result, or an array of `['ok' => false, 'error' => '...']` to refuse it.
+     *
+     * **Null means a refusal, not silence.** A `CALL` that is not answered leaves the server waiting
+     * until its own deadline, and in the server's pool a deadline is a kill — so a worker with no
+     * handler must still write a `RETURN`, saying so. That is the whole reason this is not simply an
+     * `if ($handler === null) { continue; }`.
+     *
+     * @var null|callable(array<string, mixed>): mixed
+     */
+    private $callHandler = null;
+
+    /**
      * @param resource $in  the server's end: frames to read
      * @param resource $out stdout: frames to write
      * @param resource $err stderr: diagnostics, never part of the protocol
@@ -369,6 +384,10 @@ final class Worker
                     $this->handleControl($payload);
                     break;
 
+                case MessageType::CALL:
+                    $this->answerCall($header, $payload);
+                    break;
+
                 case MessageType::LOG:
                 case MessageType::METRIC:
                 case MessageType::EVENT:
@@ -540,6 +559,98 @@ final class Worker
             'value' => $value,
             'unit' => $unit,
         ]);
+    }
+
+    /**
+     * Register what answers a `CALL` the server makes while a request is in flight.
+     *
+     * The callable receives the decoded call as an array with `name` and `params`, and may return:
+     *
+     * - a value, which becomes the `RETURN`'s result;
+     * - `['ok' => false, 'error' => 'why']`, to refuse it with a definite answer;
+     * - `['ok' => false, 'unknown' => true, 'error' => 'why']`, when the call **may have taken
+     *   effect** — a lock acquired before the reply was lost, a write sent and not acknowledged.
+     *   The server treats that differently from a refusal, because a caller that retries a refusal
+     *   is safe and a caller that retries an unknown state duplicates a side effect.
+     *
+     * A throw from the callable is caught and turned into a refused call, so a bug in an application's
+     * handler cannot kill the worker: the loop is mid-request, and a `RETURN` is still owed.
+     *
+     * Optional. Without it, a `CALL` is refused by name rather than ignored — see
+     * [`Worker::$callHandler`] for why silence is not an option.
+     *
+     * @param callable(array<string, mixed>): mixed $handler
+     */
+    public function onCall(callable $handler): void
+    {
+        $this->callHandler = $handler;
+    }
+
+    /**
+     * Answer a `CALL` from the server.
+     *
+     * Writes a `RETURN` on the call's own id in every case, including when there is no handler and
+     * when the handler threw. That is the invariant: the server is waiting, and a missing answer is
+     * indistinguishable from a dead worker until a deadline turns it into one.
+     */
+    private function answerCall(Header $header, string $payload): void
+    {
+        $call = $this->decodeJson($payload, 'a CALL');
+
+        try {
+            if ($this->callHandler === null) {
+                $this->sendJson(MessageType::RETURN, $header->requestId, [
+                    'ok' => false,
+                    'error' => 'this worker registered no call handler, so '
+                        . (string) ($call['name'] ?? 'the call') . ' cannot be served',
+                ]);
+
+                return;
+            }
+
+            $result = ($this->callHandler)($call);
+
+            // A handler that wants to say anything other than "here is the value" returns an array
+            // with `ok` in it. Checking for the key rather than for a specific shape means a result
+            // that happens to be an array of data is still sent as a result.
+            if (is_array($result) && array_key_exists('ok', $result)) {
+                $this->sendJson(MessageType::RETURN, $header->requestId, [
+                    'ok' => (bool) $result['ok'],
+                    'error' => $result['error'] ?? null,
+                    'unknown' => (bool) ($result['unknown'] ?? false),
+                    'result' => $result['result'] ?? null,
+                ]);
+
+                return;
+            }
+
+            $this->sendJson(MessageType::RETURN, $header->requestId, [
+                'ok' => true,
+                'result' => $result,
+            ]);
+        } catch (\Throwable $exception) {
+            // Caught rather than propagated, and this is the one place in the SDK where a caught
+            // exception does *not* fail the request: the loop is mid-request, the application's
+            // handler is what threw, and the server is still owed an answer. Propagating would exit
+            // the process and lose the request too, which is strictly worse than refusing one call.
+            $this->diagnose(sprintf(
+                'a call handler threw %s: %s in %s:%d',
+                $exception::class,
+                $exception->getMessage(),
+                $exception->getFile(),
+                $exception->getLine(),
+            ));
+
+            $this->sendJson(MessageType::RETURN, $header->requestId, [
+                'ok' => false,
+                'error' => 'the call handler threw ' . $exception::class,
+                // Deliberately *not* unknown: the handler threw before returning, and whether its
+                // side effects happened is the handler's business to report. Guessing "unknown" here
+                // would make every throw look like a possible effect and teach a caller to distrust
+                // the flag.
+                'unknown' => false,
+            ]);
+        }
     }
 
     /**

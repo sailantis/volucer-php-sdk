@@ -28,6 +28,8 @@ final class MessageType
     public const PING = 12;
     public const PONG = 13;
     public const ERROR = 14;
+    public const CALL = 15;
+    public const RETURN = 16;
 
     /**
      * The wire name of a type, for diagnostics.
@@ -52,6 +54,8 @@ final class MessageType
             self::PING => 'PING',
             self::PONG => 'PONG',
             self::ERROR => 'ERROR',
+            self::CALL => 'CALL',
+            self::RETURN => 'RETURN',
             default => "unknown ({$type})",
         };
     }

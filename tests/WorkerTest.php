@@ -839,4 +839,148 @@ Assert::same(
     'with the variable cleared, the transport is stdio',
 );
 
+/**
+ * A `CALL` from the server is answered, and the request it interrupted still completes.
+ *
+ * The frames go in as: a `CALL` mid-response, then the rest of the response. The frame order is the
+ * point — a call arrives *between* a response's head and its end, and the server is still owed the
+ * response afterwards.
+ */
+function call_then_response(): array
+{
+    return [
+        A_HELLO,
+        [MessageType::REQUEST, 1, [
+            'method' => 'GET',
+            'uri' => '/',
+            'protocol' => 'HTTP/1.1',
+            'headers' => [],
+            'remote_addr' => '127.0.0.1',
+            'body_len' => 0,
+            'script_filename' => '/index.php',
+            'https' => false,
+        ]],
+        // The call arrives after the request is under way. In a real deployment the server writes it
+        // while the worker is mid-request and the worker reads it at the top of its next loop, which is
+        // why the `RETURN` below is asserted to exist rather than to be in any particular position
+        // relative to the response the worker writes.
+        [MessageType::CALL, 0xFFFFFFFF, [
+            'name' => 'kv.get',
+            'params' => ['key' => 'session:1'],
+        ]],
+    ];
+}
+
+$called = [];
+$result = (function () use (&$called) {
+    // The worker is driven with a handler registered, which is what a real application does.
+    $in = server_stream(call_then_response());
+    $out = sink();
+    $err = sink();
+    $worker = new Worker($in, $out, $err);
+    $worker->onCall(function (array $call) use (&$called) {
+        $called[] = $call;
+        return ['value' => 'abc'];
+    });
+    $worker->run(static fn () => Response::text('ok'));
+
+    return ['frames' => parse_frames(drained($out)), 'stderr' => drained($err)];
+})();
+
+Assert::same('kv.get', $called[0]['name'] ?? null, 'the handler sees the call name');
+Assert::same(['key' => 'session:1'], $called[0]['params'] ?? null, 'and its params');
+
+$returns = json_of($result['frames'], MessageType::RETURN);
+Assert::same(1, count($returns), 'exactly one RETURN was written');
+// Found by type rather than by position: the worker writes its response frames in the order the\n// handler drove them, so an index would be asserting on the fixture's layout rather than on the call.\n = null;\nforeach ($result['frames'] as $frame) {\n    if ($frame['header']->messageType === MessageType::CALL) {\n        $callFrame = $frame['header']->requestId;\n    }\n}\nAssert::same(0xFFFFFFFF, $callFrame, 'the CALL carried the id the server allocated');
+Assert::same(['value' => 'abc'], $returns[0]['result'] ?? null, 'with the handler value as the result');
+Assert::same(true, $returns[0]['ok'] ?? null, 'and ok');
+
+// The response is still complete, which is the property that makes a call safe during a request.
+$ends = json_of($result['frames'], MessageType::END);
+Assert::same(1, count($ends), 'and the interrupted request still ended');
+
+/**
+ * With no handler registered, the call is **refused, not ignored**.
+ *
+ * This is the one assertion in this file that guards a hang: a dropped `CALL` leaves the server waiting
+ * until its own deadline, and in the server's pool a deadline is a kill.
+ */
+$noHandler = (function () {
+    $in = server_stream(call_then_response());
+    $out = sink();
+    $err = sink();
+    (new Worker($in, $out, $err))->run(static fn () => Response::text('ok'));
+
+    return json_of(parse_frames(drained($out)), MessageType::RETURN);
+})();
+
+Assert::same(1, count($noHandler), 'a RETURN still goes out');
+Assert::same(false, $noHandler[0]['ok'] ?? null, 'refusing the call');
+Assert::true(
+    str_contains((string) ($noHandler[0]['error'] ?? ''), 'no call handler'),
+    'and saying why: ' . ($noHandler[0]['error'] ?? '(nothing)'),
+);
+
+/**
+ * A handler may report that the call's effect is **unknown**, which is not the same as refusing it.
+ *
+ * The server retries a refusal and does not retry an unknown state, because retrying something that may
+ * have happened duplicates a side effect. If the SDK dropped the flag the two would be indistinguishable.
+ */
+$ambiguous = (function () {
+    $in = server_stream(call_then_response());
+    $out = sink();
+    $err = sink();
+    $worker = new Worker($in, $out, $err);
+    $worker->onCall(static fn (array $call) => [
+        'ok' => false,
+        'unknown' => true,
+        'error' => 'the lock backend timed out',
+    ]);
+    $worker->run(static fn () => Response::text('ok'));
+
+    return json_of(parse_frames(drained($out)), MessageType::RETURN);
+})();
+
+Assert::same(false, $ambiguous[0]['ok'] ?? null, 'the call is not ok');
+Assert::same(true, $ambiguous[0]['unknown'] ?? null, 'and it is explicitly ambiguous');
+Assert::same(false, $noHandler[0]['unknown'] ?? false, 'whereas a refusal is not');
+
+/**
+ * A handler that throws refuses the call rather than killing the worker.
+ *
+ * The loop is mid-request, so the server is still owed both the `RETURN` and the response. Propagating
+ * would exit the process and lose the request as well, which is strictly worse than refusing one call.
+ */
+$threw = (function () {
+    $in = server_stream(call_then_response());
+    $out = sink();
+    $err = sink();
+    $worker = new Worker($in, $out, $err);
+    $worker->onCall(static function (array $call): never {
+        throw new RuntimeException('a handler bug');
+    });
+    $worker->run(static fn () => Response::text('ok'));
+
+    $raw = drained($out);
+
+    return [
+        'frames' => parse_frames($raw),
+        'stderr' => drained($err),
+    ];
+})();
+
+$thrown = json_of($threw['frames'], MessageType::RETURN);
+Assert::same(false, $thrown[0]['ok'] ?? null, 'a throwing handler refuses the call');
+Assert::true(
+    str_contains((string) ($thrown[0]['error'] ?? ''), 'RuntimeException'),
+    'naming the exception: ' . ($thrown[0]['error'] ?? '(nothing)'),
+);
+Assert::same(false, $thrown[0]['unknown'] ?? true, 'and does not claim the effect is unknown');
+Assert::true(
+    str_contains($threw['stderr'], 'a handler bug'),
+    'the exception reaches stderr, not the frame stream',
+);
+Assert::same(1, count(json_of($threw['frames'], MessageType::END)), 'and the request still ended');
 exit(Assert::report('worker behaviour'));

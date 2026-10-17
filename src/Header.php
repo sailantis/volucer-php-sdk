@@ -93,9 +93,9 @@ final class Header
             ));
         }
 
-        if ($fields['type'] < MessageType::HELLO || $fields['type'] > MessageType::ERROR) {
+        if ($fields['type'] < MessageType::HELLO || $fields['type'] > MessageType::RETURN) {
             throw new ProtocolException(
-                'unknown message type ' . $fields['type'] . ' (v1 defines 1..14)'
+                'unknown message type ' . $fields['type'] . ' (this SDK defines 1..16)'
             );
         }
 
