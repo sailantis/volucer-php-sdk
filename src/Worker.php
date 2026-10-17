@@ -208,6 +208,27 @@ final class Worker
     private $callHandler = null;
 
     /**
+     * The next call id, counting down from the top of the range.
+     *
+     * Allocated here rather than by the server, because the direction is worker → server: this worker
+     * asks and the server answers, so the worker owns the id space. Counted down from `0xFFFFFFFF` so
+     * that it can never collide with a request id, which counts up from 1.
+     */
+    private int $nextCallId = 0xFFFFFFFF;
+
+    /**
+     * Why the last call failed, or null if it did not.
+     *
+     * @var null|string
+     */
+    private $lastCallError = null;
+
+    /**
+     * Whether the last failed call may have taken effect on the server.
+     */
+    private bool $lastCallUnknown = false;
+
+    /**
      * @param resource $in  the server's end: frames to read
      * @param resource $out stdout: frames to write
      * @param resource $err stderr: diagnostics, never part of the protocol
@@ -676,6 +697,171 @@ final class Worker
     public function currentRequestId(): int
     {
         return $this->requestId;
+    }
+
+    // -------------------------------------------------------------------- calls
+
+    /**
+     * Ask the server to do something, from inside a request handler.
+     *
+     * The one method that sends a frame to the server *unprompted* and then waits for its answer, and
+     * it is what the whole call plane exists for: `kv.get`, `lock.acquire`, `jobs.push`,
+     * `metrics.observe`, and the `workers.*` / `config.*` control methods.
+     *
+     * **Only callable while a request is in flight.** The answer arrives on the same channel as the
+     * response, and the server's reader for this worker is parked on `recv()` between requests — so a
+     * call made outside a handler has nobody listening for the `RETURN` and would block until the
+     * deadline. It raises rather than hanging, because a hang here is a worker killed for no visible
+     * reason.
+     *
+     * @param string $name   `"<namespace>.<verb>"`, e.g. `kv.get`.
+     * @param array<string, mixed> $params method-specific arguments.
+     *
+     * @return mixed the call's result, or null when the server refused it; see {@see Worker::lastCallError()}.
+     *
+     * @throws ProtocolException if the stream desynchronised, or a call was made outside a request.
+     */
+    public function call(string $name, array $params = []): mixed
+    {
+        if ($this->requestId === self::UNSOLICITED) {
+            throw new ProtocolException(sprintf(
+                'call("%s") was made outside a request: the server has nobody reading this worker '
+                . 'between requests, so the answer would never be seen',
+                $name,
+            ));
+        }
+
+        $id = $this->nextCallId();
+        $this->lastCallError = null;
+        $this->lastCallUnknown = false;
+        $this->sendJson(MessageType::CALL, $id, ['name' => $name, 'params' => $params]);
+
+        return $this->awaitReturn($id, $name);
+    }
+
+    /**
+     * Why the last {@see Worker::call()} did not return a result, or null if it did.
+     *
+     * Separate from the return value because a call and a function that returns null are not the same
+     * thing: `kv.get` on a missing key returns null and *succeeded*, and a caller that could not tell
+     * the two apart would treat a cache miss as a failure. Set on every call, so reading it after a
+     * `null` result is meaningful and reading it after a non-null one is not.
+     */
+    public function lastCallError(): ?string
+    {
+        return $this->lastCallError;
+    }
+
+    /**
+     * Whether the call that failed may have taken effect.
+     *
+     * The distinction the `RETURN` frame carries and the server documents: a definite refusal is safe
+     * to retry, and an unknown state is not, because retrying it duplicates a side effect. Exposed
+     * rather than folded into the error string so that a caller can branch on it.
+     */
+    public function lastCallWasUnknown(): bool
+    {
+        return $this->lastCallUnknown;
+    }
+
+    /**
+     * The next call id, counting down from the top of the range.
+     *
+     * Counted down so that the two id spaces cannot collide: request ids are the server's and start at
+     * 1, call ids are this worker's and start at `0xFFFFFFFF`.
+     */
+    private function nextCallId(): int
+    {
+        $id = $this->nextCallId;
+        // Wrapping to `0x80000001` rather than to zero: below `0x80000000` an id would look like a
+        // request's to the server, which decides by which half of the range an id falls in. The wrap
+        // is four billion calls away and the alternative is a correlation failure that looks real.
+        $this->nextCallId = $id <= 0x80000001 ? 0xFFFFFFFF : $id - 1;
+
+        return $id;
+    }
+
+    /**
+     * Read frames until the answer to `$id` arrives, answering anything else that comes first.
+     *
+     * **A small dispatch loop, not a nested pump.** Between the call and its answer the server may send
+     * a `PING`, a `CONTROL`, or another `CALL` — all three are ordinary and none of them is this call's
+     * answer, so each is handled exactly as the main loop handles it and the read resumes. Nothing here
+     * re-enters the request path, which is what keeps "one request in flight" true while a call is
+     * outstanding.
+     *
+     * **Blocking, with no timeout of its own**, and that is a decision rather than an omission. The
+     * protocol guarantees that every call is answered — a refusal is a `RETURN` like any other, and the
+     * server's side of that rule is that a call it cannot serve is still answered by name. So a worker
+     * waiting here is waiting for a frame that is already on its way. A timeout would need
+     * `stream_select`, which is meaningless on a Windows pipe, and it would put the deadline in the
+     * wrong place: the server is the side that knows how long a backend may take, and §4.2 of
+     * `docs/plugins.md` puts the per-call deadline *inside the handler* for exactly that reason. Reading
+     * as the main loop reads also means a timeout cannot leave half a frame in a buffer.
+     *
+     * @return mixed
+     */
+    private function awaitReturn(int $id, string $name): mixed
+    {
+        while (true) {
+            $header = $this->readHeader();
+            if ($header === null) {
+                $this->lastCallError = sprintf('call "%s": the server closed the connection', $name);
+                $this->lastCallUnknown = true;
+                throw new ProtocolException($this->lastCallError);
+            }
+            $payload = $this->readPayload($header);
+
+            switch ($header->messageType) {
+                case MessageType::RETURN:
+                    if ($header->requestId !== $id) {
+                        // A different call's answer, which cannot happen while calls are issued
+                        // sequentially — and if it does, the two id spaces have been mixed up.
+                        throw new ProtocolException(sprintf(
+                            'expected the answer to call 0x%08X but the server answered 0x%08X',
+                            $id,
+                            $header->requestId,
+                        ));
+                    }
+
+                    return $this->acceptReturn($payload, $name);
+                case MessageType::CALL:
+                    $this->answerCall($header, $payload);
+                    break;
+                case MessageType::PING:
+                    $this->send(new Frame(MessageType::PONG, self::UNSOLICITED));
+                    break;
+                case MessageType::CONTROL:
+                    $this->handleControl($payload);
+                    break;
+                default:
+                    throw new ProtocolException(sprintf(
+                        'the server sent a %s while call "%s" was outstanding, which is not a frame '
+                        . 'a worker can receive',
+                        $header->typeName(),
+                        $name,
+                    ));
+            }
+        }
+    }
+
+    /**
+     * Turn a `RETURN` payload into a result, or into a recorded error.
+     *
+     * @return mixed
+     */
+    private function acceptReturn(string $payload, string $name): mixed
+    {
+        $answer = $this->decodeJson($payload, 'a RETURN');
+
+        if (($answer['ok'] ?? true) === true) {
+            return $answer['result'] ?? null;
+        }
+
+        $this->lastCallError = (string) ($answer['error'] ?? 'the server refused the call without saying why');
+        $this->lastCallUnknown = ($answer['unknown'] ?? false) === true;
+
+        return null;
     }
 
     // ---------------------------------------------------------------- handshake

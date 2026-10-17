@@ -892,7 +892,17 @@ Assert::same(['key' => 'session:1'], $called[0]['params'] ?? null, 'and its para
 
 $returns = json_of($result['frames'], MessageType::RETURN);
 Assert::same(1, count($returns), 'exactly one RETURN was written');
-// Found by type rather than by position: the worker writes its response frames in the order the\n// handler drove them, so an index would be asserting on the fixture's layout rather than on the call.\n = null;\nforeach ($result['frames'] as $frame) {\n    if ($frame['header']->messageType === MessageType::CALL) {\n        $callFrame = $frame['header']->requestId;\n    }\n}\nAssert::same(0xFFFFFFFF, $callFrame, 'the CALL carried the id the server allocated');
+
+// The `CALL` in the fixture is a frame the *server* wrote, so it must not appear among the frames
+// the worker wrote back. This assertion is what caught the opposite claim, which is worth recording
+// because it is the trap in this direction: the worker *answers* a call and *originates* nothing, so
+// a test that looks for a `CALL` in the worker's output is asserting on the wrong side of the
+// connection and would pass against an empty stream.
+Assert::same(
+    0,
+    count(payloads_of($result['frames'], MessageType::CALL)),
+    'a worker never writes a CALL; the server is the only side that sends one',
+);
 Assert::same(['value' => 'abc'], $returns[0]['result'] ?? null, 'with the handler value as the result');
 Assert::same(true, $returns[0]['ok'] ?? null, 'and ok');
 
@@ -983,4 +993,116 @@ Assert::true(
     'the exception reaches stderr, not the frame stream',
 );
 Assert::same(1, count(json_of($threw['frames'], MessageType::END)), 'and the request still ended');
+
+/**
+ * A worker **makes** a call from inside a request handler and reads the answer.
+ *
+ * The other half of the call plane, and the half nothing exercised before: the tests above drive a
+ * `CALL` the server sent, while this drives one the worker sends. It is `Worker::call()`, and what it
+ * has to get right is that the answer is *correlated* — read by a small loop that skips past frames
+ * which are not this call's answer — and that the response the worker was in the middle of is
+ * unaffected.
+ *
+ * The fixture sends the `RETURN` only after an unrelated `PING` and an unrelated `CALL`, so a client
+ * that accepted the first frame it read would return the wrong thing and a client that could not nest
+ * a dispatch would deadlock. Both are what this is for.
+ */
+function a_call_during_a_request(): array
+{
+    return [
+        A_HELLO,
+        [MessageType::REQUEST, 1, [
+            'method' => 'GET',
+            'uri' => '/',
+            'protocol' => 'HTTP/1.1',
+            'headers' => [],
+            'remote_addr' => '127.0.0.1',
+            'body_len' => 0,
+            'script_filename' => '/index.php',
+            'https' => false,
+        ]],
+        // A PING first: not this call's answer, and the worker must answer it and keep reading.
+        [MessageType::PING, 0],
+        // Then another CALL: also not the answer, and the worker answers it with its own RETURN.
+        [MessageType::CALL, 0xFFFFFFFE, [
+            'name' => 'config.describe',
+            'params' => [],
+        ]],
+        // Only now the answer to the call the handler made.
+        [MessageType::RETURN, 0xFFFFFFFF, [
+            'ok' => true,
+            'result' => ['value' => 'from the server'],
+        ]],
+    ];
+}
+
+$made = (function () {
+    $in = server_stream(a_call_during_a_request());
+    $out = sink();
+    $err = sink();
+    $worker = new Worker($in, $out, $err);
+    // The worker also answers calls, so that the nested CALL in the fixture is not left unanswered.
+    $worker->onCall(static fn (array $call) => ['described' => true]);
+    $seen = null;
+    $worker->run(static function ($request, Worker $worker) use (&$seen) {
+        $seen = $worker->call('kv.get', ['key' => 'session:1']);
+
+        return Response::text('ok');
+    });
+
+    return [
+        'frames' => parse_frames(drained($out)),
+        'seen' => $seen,
+        'stderr' => drained($err),
+    ];
+})();
+
+Assert::same(
+    ['value' => 'from the server'],
+    $made['seen'],
+    'the answer to the call is returned to the handler: ' . $made['stderr'],
+);
+
+$written = $made['frames'];
+$callIds = [];
+foreach ($written as $frame) {
+    if ($frame['header']->messageType === MessageType::CALL) {
+        $callIds[] = $frame['header']->requestId;
+    }
+}
+Assert::same(
+    [0xFFFFFFFF],
+    $callIds,
+    'the worker wrote exactly one CALL, on an id from the top of the range (so it cannot be mistaken '
+    . 'for a request id, which counts up from 1)',
+);
+Assert::same(
+    1,
+    count(payloads_of($written, MessageType::PONG)),
+    'and it answered the PING it had to read past',
+);
+
+// The unrelated `CALL` from the fixture is answered too — that is what makes this a dispatch loop and
+// not a skip — and it is answered on *its own* id, not on the id of the call the handler made.
+$returns = [];
+foreach ($written as $frame) {
+    if ($frame['header']->messageType === MessageType::RETURN) {
+        $returns[] = $frame['header']->requestId;
+    }
+}
+Assert::same(
+    [0xFFFFFFFE],
+    $returns,
+    'the CALL that arrived mid-call was answered on its own id, so the worker is never confused '
+    . 'about which call a frame belongs to',
+);
+
+// And the request the handler was serving still completed, which is the property that lets a call
+// happen at all: the response exchange is untouched by everything above.
+Assert::same(
+    1,
+    count(json_of($written, MessageType::END)),
+    'the interrupted request still ended normally',
+);
+
 exit(Assert::report('worker behaviour'));
