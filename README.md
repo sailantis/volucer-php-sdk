@@ -160,6 +160,43 @@ a leaked global, a stuck connection, a fat static cache. The server sees `keep_a
 `END` and boots a replacement; the request that asked is still answered normally, so a handler
 never has to choose between responding and being cleaned up.
 
+### `Session`
+
+A worker is not a SAPI, so the session half of what PHP normally does for an application is
+missing: nothing reads the `Cookie` header, and `header()`/`setcookie()` cannot deliver the
+`Set-Cookie` back. `Volucer\Session` does both, and every framework bridge should use it rather
+than reimplement it.
+
+| Method | Purpose |
+| --- | --- |
+| `begin($request)` | adopt the session the request presented, and relax PHP's cookie handling |
+| `beginWithCookies($cookies)` | the same, for a request that is not a `Volucer\Request` (PSR-7, a framework's own) |
+| `applyTo($response)` | **add the `Set-Cookie` and end the request** — the normal call |
+| `cookie()` | the `Set-Cookie` value alone, for a response object this SDK does not own |
+| `end()` | end the session and forget the id, if you did not use `applyTo()` |
+
+```php
+$session = new Session();
+
+$handler = static function (Request $request, Worker $worker) use ($session): Response {
+    $session->begin($request);
+
+    session_start();              // the application's own choice, as under FPM
+    $_SESSION['seen'] = true;
+
+    return $session->applyTo(Response::text('ok'));
+};
+```
+
+**`applyTo()` ends the request as well, deliberately.** `session_id()` outlives the request, so a
+client arriving with no cookie would otherwise inherit the previous client's session — and reading
+the id *after* ending the session yields `''`, which means a caller that gets the order wrong drops
+the cookie **silently**: the session is created on every request, and nothing logs a word. Fusing
+the two removes the opportunity. Calling `end()` as well is harmless.
+
+A session is not started for you. A request that never calls `session_start()` — a 404, a static
+file — creates no session and gets no cookie, exactly as under FPM.
+
 Each `END` frame reports `peak_memory_bytes` for **that request**, not for the process. The worker
 reads `memory_get_peak_usage(true)` and then calls `memory_reset_peak_usage()`, so a spike in one
 request does not make the server recycle the worker after every later one. That reset exists on
