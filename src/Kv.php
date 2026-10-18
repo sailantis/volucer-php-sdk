@@ -154,6 +154,46 @@ final class Kv
     }
 
     /**
+     * Store a value **only if the key is not already there**, answering whether it was stored.
+     *
+     * This is the primitive a lock cannot be. A TTL lock has no fencing token, so a worker that stalls
+     * past its deadline can be inside a section somebody else has entered — the server says so at
+     * [Worker::lock](../README.md) and in `docs/plugins.md` §9.2. Where a real invariant is at stake, the
+     * storage decides instead: `true` means this call's value is the one under the key, `false` means
+     * somebody else's already was, and **`false` is a success** — a caller that treats it as a failure
+     * retries a write that was correctly refused.
+     *
+     * The atomicity is the driver's: `SET NX` on Redis, a shard lock in memory, `O_CREAT|O_EXCL` on the
+     * file driver. A check-then-act on the client side would not be — that is why the server grew the
+     * method rather than leaving it to be composed out of `has` and `set`.
+     *
+     * `$ttl` is in seconds and behaves as it does on [set], except that `0` is **refused by the server**
+     * rather than treated as a delete: a conditional write that immediately deletes is a no-op nobody
+     * asked for.
+     */
+    public function setIfAbsent(string $key, mixed $value, ?int $ttl = null): bool
+    {
+        if ($ttl !== null && $ttl <= 0) {
+            throw new \InvalidArgumentException(
+                'setIfAbsent does not take a zero or negative TTL; it would delete the key it was '
+                . 'asked to create. Pass null for no expiry, or use delete().'
+            );
+        }
+
+        $params = [
+            'key' => self::key($key),
+            'value' => self::base64(($this->encode)($value)),
+        ];
+        if ($ttl !== null) {
+            $params['ttl'] = $ttl;
+        }
+
+        $answer = $this->ask($this->method('setIfAbsent'), $params);
+
+        return ($answer['stored'] ?? false) === true;
+    }
+
+    /**
      * Whether a key is stored, without reading it.
      */
     public function has(string $key): bool
