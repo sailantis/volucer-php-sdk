@@ -38,6 +38,52 @@ Assert::same('/run/app.sock', Supervisor::relayPath('  unix:/run/app.sock  '), '
 Assert::same(null, Supervisor::relayPath('127.0.0.1:9700'), 'a TCP relay has no path');
 Assert::same('', Supervisor::relayPath('unix:'), 'unix: with no path is an empty path, not a TCP one');
 
+// ------------------------------------------- where the relay address comes from
+
+/*
+ * The argument wins, the environment is the fallback, and an empty string means "unset" in both
+ * places. The last rule is not pedantry: `Environment=VOLUCER_RELAY_SOCKET=` in a unit file and
+ * `export VOLUCER_RELAY_SOCKET=` in a shell both produce an empty value, and reporting *that* as
+ * an empty address sends an operator looking for a typo in a file that never mentions the key.
+ */
+$previousRelay = getenv(Supervisor::RELAY_ENV);
+
+$withRelay = static function (string $value): void {
+    putenv(Supervisor::RELAY_ENV . '=' . $value);
+};
+$withoutRelay = static function (): void {
+    putenv(Supervisor::RELAY_ENV);
+};
+
+$withoutRelay();
+Assert::same('/run/from-flag.sock', Supervisor::relay('/run/from-flag.sock'), 'the argument is used when given');
+Assert::same(null, Supervisor::relay(null), 'no argument and no environment is null, not an empty string');
+
+$withRelay('unix:/run/from-env.sock');
+Assert::same(
+    'unix:/run/from-env.sock',
+    Supervisor::relay(null),
+    'the environment is the fallback when the argument is absent',
+);
+Assert::same(
+    '/run/from-flag.sock',
+    Supervisor::relay('/run/from-flag.sock'),
+    'and the argument still wins over it, so a stale variable cannot move a deployment',
+);
+Assert::same('unix:/run/from-env.sock', Supervisor::relay('  '), 'a blank argument is absent, not an address');
+
+$withRelay('   ');
+Assert::same(null, Supervisor::relay(null), 'a whitespace-only environment value is unset');
+
+$withRelay('  unix:/run/padded.sock  ');
+Assert::same('unix:/run/padded.sock', Supervisor::relay(null), 'the environment value is trimmed like the argument');
+
+if (is_string($previousRelay)) {
+    $withRelay($previousRelay);
+} else {
+    $withoutRelay();
+}
+
 /*
  * The refusal on a build without `pcntl` is checked *before* the listener is created, so a
  * supervisor that cannot fork leaves no socket file behind. On a build that can fork the same call

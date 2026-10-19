@@ -5,7 +5,13 @@ declare(strict_types=1);
 /**
  * The same routes as `worker.php`, served through the `attach` backend.
  *
+ *     php example/supervisor.php                 # the relay from VOLUCER_RELAY_SOCKET
  *     php example/supervisor.php unix:/run/app/workers.sock
+ *
+ * The argument is optional on purpose. The address is the one fact the server's `relay` and this
+ * process both have to know, so the deployment can write it once — in the unit file or the
+ * container's environment — and both sides read it. A value given here still wins, which is what
+ * makes a hand-run supervisor possible without touching the environment.
  *
  * This is the whole difference between the two files, and it is worth seeing side by side:
  * `worker.php` calls `Worker::connect()` and serves *one* connection that the server opened;
@@ -32,8 +38,13 @@ use Volucer\Supervisor;
 use Volucer\Worker;
 
 $relay = $argv[1] ?? '';
-if ($relay === '') {
-    fwrite(STDERR, "usage: php example/supervisor.php <unix:/path/to.sock|host:port>\n");
+
+if ($relay === '' && Supervisor::relay() === null) {
+    fwrite(
+        STDERR,
+        "usage: php example/supervisor.php [unix:/path/to.sock|host:port]\n"
+        . 'or set ' . Supervisor::RELAY_ENV . " to the same relay the server's `relay` names\n",
+    );
     exit(2);
 }
 
@@ -86,4 +97,5 @@ $handler = static function (Request $request, Worker $worker) use ($startedAt): 
     return null;
 };
 
-Supervisor::serve($relay, $handler);
+// An empty string reaches `serve()` as "absent", which is where `VOLUCER_RELAY_SOCKET` is read.
+Supervisor::serve($relay === '' ? null : $relay, $handler);

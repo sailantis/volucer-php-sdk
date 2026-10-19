@@ -51,6 +51,50 @@ final class Supervisor
     public const UNIX_PREFIX = 'unix:';
 
     /**
+     * The environment variable naming the relay an `attach` backend dials.
+     *
+     * The counterpart of [`Worker::SOCKET_ENV`], and for the same purpose: one address both halves
+     * of a deployment have to agree on, written once. The difference is direction. That variable is
+     * set *by* the server, on a child it spawned, so a supervisor cannot use it — there is no
+     * spawned child, and the value there would be whatever an enclosing environment happened to
+     * leave. This one is set by the *operator*, in the unit file or the container environment, and
+     * both the server and the supervisor read it.
+     */
+    public const RELAY_ENV = 'VOLUCER_RELAY_SOCKET';
+
+    /**
+     * The relay to listen on: the argument, else the environment, else `null`.
+     *
+     * `null` rather than an exception, because whether a missing relay is an error depends on the
+     * caller. [`Supervisor::serve`] takes `null` to mean the caller should fail with a message
+     * naming both places; a test or an embedding application may want to decide for itself.
+     *
+     * The trimming rule is [`Worker::socketAddress`]'s, deliberately: an empty value is what a
+     * shell produces from `VOLUCER_RELAY_SOCKET=`, and reporting it as an empty address would
+     * send the operator looking for a typo in a file that never mentions the key.
+     */
+    public static function relay(?string $relay = null): ?string
+    {
+        if ($relay !== null) {
+            $relay = trim($relay);
+
+            if ($relay !== '') {
+                return $relay;
+            }
+        }
+
+        $address = getenv(self::RELAY_ENV);
+
+        if (!is_string($address)) {
+            return null;
+        }
+
+        $address = trim($address);
+
+        return $address === '' ? null : $address;
+    }
+
+    /**
      * How long `accept` waits before the master reaps children and looks again.
      *
      * It costs a caller nothing: `accept` returns the instant a connection is pending, so this only
@@ -178,8 +222,13 @@ final class Supervisor
      * The master runs until it is asked to stop. `SIGTERM`/`SIGINT` stop it accepting, close the
      * listener, remove the socket file, and wait briefly for the children already serving — the
      * graceful half of what a service manager expects.
+     *
+     * `$relay` may be `null`, in which case [`Supervisor::relay`] reads `VOLUCER_RELAY_SOCKET`. That
+     * is the form a deployment should use: the server reads the same variable for its `relay`, so
+     * the address is written once instead of in two files that nothing keeps in sync. A value
+     * passed here still wins, so a script that names its own socket keeps meaning what it says.
      */
-    public static function serve(string $relay, callable $handler, int $children = 0): void
+    public static function serve(?string $relay, callable $handler, int $children = 0): void
     {
         if ($children < 0) {
             throw new \InvalidArgumentException(sprintf(
@@ -189,6 +238,16 @@ final class Supervisor
         }
 
         self::requireFork();
+
+        $relay = Supervisor::relay($relay);
+
+        if ($relay === null) {
+            throw new \RuntimeException(sprintf(
+                'no relay to listen on: pass one to Supervisor::serve(), or set %s — the same '
+                . 'variable the server reads for its `relay`, e.g. "unix:/run/app/workers.sock"',
+                self::RELAY_ENV,
+            ));
+        }
 
         $limit = $children > 0 ? $children : null;
         $listener = self::listen($relay);

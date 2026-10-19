@@ -129,7 +129,7 @@ $app = new App();
 $app->bootstrap();                  // boot before the fork, or every child boots its own
 
 Volucer\Supervisor::serve(
-    'unix:/run/app/workers.sock',
+    null,                           // or 'unix:/run/app/workers.sock'
     static fn (Volucer\Request $request): Volucer\Response => new Volucer\Response(
         200,
         [['Content-Type', 'text/html; charset=utf-8']],
@@ -141,12 +141,27 @@ Volucer\Supervisor::serve(
 ```toml
 [backends.app]
 kind    = "attach"
-relay   = "unix:/run/app/workers.sock"
 workers = 16
 ```
 
 The handler is the same callable `Worker::run()` takes, so a worker file usually becomes a
 supervisor by replacing its last line and nothing else.
+
+**The address can be written once.** With the first argument `null` the supervisor reads
+`VOLUCER_RELAY_SOCKET`, and so does the server when `relay` is omitted:
+
+```ini
+# the unit file, or a container's environment
+Environment=VOLUCER_RELAY_SOCKET=unix:/run/app/workers.sock
+```
+
+That is the counterpart of `VOLUCER_WORKER_SOCKET`, and it exists for the mirror-image reason. That
+one is set *by* the server on a child it spawned, so a supervisor cannot read it: no child was
+spawned, and the value there would be whatever an enclosing environment left behind. This one is
+set by the operator, and both sides read it. A value passed to `serve()`, or a `relay` key in the
+file, still wins — so a stale variable in a shell cannot move a deployment, and a hand-run
+supervisor that names its own socket still means it. `Supervisor::relay($relay = null)` is that
+resolution on its own, for a caller that wants to decide what "missing" means.
 
 Each child serves exactly one connection and exits. That is what makes recycling cheap — when
 `max_requests` is reached volucer closes the slot, the child sees end-of-file, exits, and the
