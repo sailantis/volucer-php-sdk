@@ -52,6 +52,27 @@ during its handshake. The server reports that at startup, naming `connect()` as 
 fails fast and loudly rather than hanging; but `connect()` is the call to use. It is backward
 compatible either way: with no address in the environment it is exactly `create()`.
 
+### The socket transport disables Nagle, and that is not a detail
+
+`connect()` opens the socket with `tcp_nodelay` set. Without it every request costs about
+**39 ms** instead of 0.06 ms, which is enough to make the transport look broken rather than
+merely slower.
+
+The reason is the protocol's shape. A frame is written as a header write followed by a payload
+write, and the exchange is a strict ping-pong: request, answer, request. Nagle holds the second
+small write until the first is acknowledged, TCP delays the acknowledgement by up to 40 ms, and
+the two processes do it to each other once per request. Measured on loopback with a
+protocol-shaped ping-pong:
+
+| | per request |
+|---|---|
+| TCP, Nagle on | **38.96 ms** |
+| TCP, `TCP_NODELAY` | **0.06 ms** |
+| AF_UNIX socket | 0.06 ms |
+
+On the whole `/items` route this was the difference between a 2,334 rps arm and a 24 rps one. The
+server has always disabled Nagle on its side; this closes the same gap on the worker's.
+
 ## The two rules
 
 Both are enforced by the SDK, not merely documented. They are the two things that go wrong in

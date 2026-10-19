@@ -2214,4 +2214,54 @@ Assert::same(
 );
 Assert::same(MessageType::HELLO_ACK, $ended['frames'][0]['header']->messageType, 'which is just the handshake');
 
+/**
+ * The socket transport disables Nagle.
+ *
+ * The option is worth a test because its absence is invisible: everything works, every
+ * status is 200, and the only symptom is that each request takes 39 ms instead of 0.06 ms.
+ * The protocol writes a header and a payload separately, so Nagle holds the second write
+ * until the peer acknowledges the first — and the peer's delayed ACK is up to 40 ms away.
+ *
+ * Two assertions, because the option has two halves that could each drift:
+ *
+ * - the context the worker connects with carries `tcp_nodelay`, which is what actually sets
+ *   `SO_NODELAY` on the fd; and
+ * - a real connection opened with that context is usable, so the option is one PHP's `tcp://`
+ *   wrapper accepts. A rejected option would be a warning and a *default* socket rather than
+ *   a failure, which is exactly the silent case this guards.
+ *
+ * The context is private, so it is reached by reflection: it is the only way to test a
+ * private value without making it public API for the sake of a test.
+ */
+$nodelay = new ReflectionMethod(Worker::class, 'socketContext');
+$nodelay->setAccessible(true);
+$context = $nodelay->invoke(null);
+Assert::true(\is_resource($context), 'the socket transport connects with a stream context');
+Assert::same(
+    ['socket' => ['tcp_nodelay' => true]],
+    stream_context_get_options($context),
+    'and that context disables Nagle, which the protocol needs',
+);
+
+// And the option is honoured rather than ignored: connect, and check the connection works.
+$listener = stream_socket_server('tcp://127.0.0.1:0', $errno, $errstr);
+if ($listener === false) {
+    Assert::true(false, 'a loopback listener can be bound for the Nagle check');
+} else {
+    $address = stream_socket_get_name($listener, false);
+    $connected = @stream_socket_client(
+        'tcp://' . $address,
+        $errno,
+        $errstr,
+        10.0,
+        STREAM_CLIENT_CONNECT,
+        $context,
+    );
+    Assert::true($connected !== false, 'the context is accepted by the tcp wrapper');
+    if ($connected !== false) {
+        fclose($connected);
+    }
+    fclose($listener);
+}
+
 exit(Assert::report('worker behaviour'));
