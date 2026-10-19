@@ -1439,13 +1439,21 @@ final class Worker
 
     /**
      * Act on a CONTROL frame, acknowledging it either way.
+     *
+     * The `CONTROL_ACK` is **best effort**, and the reason is `attach`. Recycling an attached slot
+     * is `Slot::stop()` in the server: it sends `CONTROL drain` and then closes the connection
+     * *without* reading the answer, because the decision to stop is already made and no reply can
+     * change it. A worker that insisted on writing that ack would take a broken pipe on every
+     * single recycle — measured as a notice plus an error line per request under `max_requests` —
+     * and would then exit as a failure rather than as a clean stop. The ack is a courtesy to a
+     * server that is still listening; a server that has gone is not an error this worker made.
      */
     private function handleControl(string $payload): void
     {
         $control = $this->decodeJson($payload, 'a CONTROL');
         $kind = is_string($control['kind'] ?? null) ? $control['kind'] : '';
 
-        $this->send(new Frame(MessageType::CONTROL_ACK, self::UNSOLICITED));
+        $this->acknowledgeControl();
 
         switch ($kind) {
             case 'drain':
@@ -1477,6 +1485,38 @@ final class Worker
             default:
                 $this->diagnose("unknown control kind '{$kind}' acknowledged and ignored");
         }
+    }
+
+    /**
+     * Acknowledge a CONTROL, tolerating a server that closed without reading the answer.
+     *
+     * `Slot::stop()` in the server closes the connection immediately after sending `CONTROL drain`,
+     * so this write legitimately fails on every recycle of an `attach` slot. The failure carries no
+     * information — the server made a decision no ack can change — so it is swallowed here rather
+     * than promoted to a protocol error. A `send()` failure with any *other* cause still surfaces,
+     * because those are bugs rather than this one known shape.
+     *
+     * The write goes through {@see write()} with the error suppressed at the call rather than with a
+     * process-wide `error_reporting()` change: a warning printed by PHP's handler would otherwise
+     * reach stderr before the exception could be caught, and toggling the global level for the
+     * duration of a write is a side effect on an application that never asked for one.
+     */
+    private function acknowledgeControl(): void
+    {
+        $bytes = (new Frame(MessageType::CONTROL_ACK, self::UNSOLICITED))->encode($this->checksum);
+        $length = strlen($bytes);
+        $offset = 0;
+
+        while ($offset < $length) {
+            $written = @fwrite($this->out, $offset === 0 ? $bytes : substr($bytes, $offset));
+            if ($written === false || $written === 0) {
+                // The server is gone. Not this worker's failure, and not a reason to exit non-zero.
+                return;
+            }
+            $offset += $written;
+        }
+
+        @fflush($this->out);
     }
 
     // ------------------------------------------------------------ request side

@@ -108,6 +108,94 @@ When the server wants the worker to stop it closes the child's stdin. The loop r
 clean EOF and returns from `run()`, so the worker exits on its own. There is **no signal to
 catch** and no flag to poll — which is why the server never has to ask twice before killing.
 
+## Attaching instead of spawning
+
+The `worker` backend starts your process. The `attach` backend does not: it *dials* a relay that a
+supervisor in your own process listens on, and holds one connection per slot. That is the shape that
+lets a supervisor fork its workers after booting the application once, so every child inherits the
+interpreter, the loaded classes and the OPcache segment instead of mapping them again.
+
+The split matters: **volucer cannot own the fork.** It has to happen in the application's process,
+because a PHP process cannot hand a file descriptor to another one — `ext/sockets` has no
+`SCM_RIGHTS`, so the side that owns the listening socket has to be the side that owns the fork. So
+the fork lives in `Volucer\Supervisor`, and you call it:
+
+```php
+<?php
+// supervisor.php — boot once, then fork
+require __DIR__ . '/vendor/autoload.php';
+
+$app = new App();
+$app->bootstrap();                  // boot before the fork, or every child boots its own
+
+Volucer\Supervisor::serve(
+    'unix:/run/app/workers.sock',
+    static fn (Volucer\Request $request): Volucer\Response => new Volucer\Response(
+        200,
+        [['Content-Type', 'text/html; charset=utf-8']],
+        $app->handle($request),
+    ),
+);
+```
+
+```toml
+[backends.app]
+kind    = "attach"
+relay   = "unix:/run/app/workers.sock"
+workers = 16
+```
+
+The handler is the same callable `Worker::run()` takes, so a worker file usually becomes a
+supervisor by replacing its last line and nothing else.
+
+Each child serves exactly one connection and exits. That is what makes recycling cheap — when
+`max_requests` is reached volucer closes the slot, the child sees end-of-file, exits, and the
+supervisor forks a replacement for the next connection. The supervisor reaps its children, so a
+long-lived one does not fill the process table with zombies.
+
+**`children` needs no tuning.** The third argument caps how many children may run at once, and the
+default (`0`) is *no cap*, which is what an `attach` deployment wants: volucer dials `workers` times
+and holds one connection per slot, so the live children are already bounded by that number. A cap
+below `workers` is not a queue — the surplus dials sit unaccepted in the listen backlog while the
+pool waits for a handshake no child is there to send.
+
+**Unix only.** Windows has no `pcntl`, and `serve()` raises there rather than silently running a
+single process. Use `kind = "worker"` or `kind = "upstream"` on Windows.
+
+**Boot before the fork, connect after it.** A container, loaded classes and a warm template cache
+are inherited by every child, which is the saving. An *open database connection* must not be: every
+child would inherit the socket and they would take turns reading from it. Open connections lazily,
+per child, on the first request — doctrine's `EntityManager` and PDO both do this already.
+
+### Writing a supervisor yourself
+
+`Supervisor::serve()` is a convenience, not the contract. What `attach` needs from any supervisor is
+that it serves a connection **it** opened, which is `Worker::create()`:
+
+```php
+$listener = stream_socket_server('unix:///run/app/workers.sock', $errno, $errstr);
+
+while (true) {
+    $connection = stream_socket_accept($listener, -1);
+    $pid = pcntl_fork();
+
+    if ($pid !== 0) {
+        fclose($connection);        // the master must drop its copy
+        continue;
+    }
+
+    fclose($listener);
+    Worker::create($connection, $connection)->run($handler);
+    exit(0);                        // not a return: a child must not run the master's shutdown
+}
+```
+
+Two details are load-bearing and easy to miss. `Worker::create()`, not `connect()` — the connection
+already exists and is handed over. And the accept has to happen in the master, before the fork: the
+kernel wakes one waiter per connection and does it unfairly, so N children sharing one listener can
+leave one holding two connections and another none, which for volucer is a slot whose connection
+nobody is reading.
+
 ## Writing a handler
 
 The handler receives the `Request` and returns one of:
@@ -175,6 +263,19 @@ $response->withStatus(201)->withHeader('X-Trace', 'abc')->withBody('…');
 | `emitMetric($name, $value, $unit)` | one metric sample, unsolicited. `$name` must be a Prometheus name (`[a-zA-Z_][a-zA-Z0-9_]*`) and declared in the server's `[metrics.collect]` |
 | `recycle()` | ask the server to replace this worker after the request |
 | `currentRequestId()` | the in-flight request id, for telemetry correlation |
+
+### `Supervisor`
+
+The `attach` half, in its own class because it is a different call: `Worker` serves one connection
+the server opened, and `Supervisor` serves many, forking one child each. See
+[Attaching instead of spawning](#attaching-instead-of-spawning).
+
+| Method | Purpose |
+| --- | --- |
+| `Supervisor::serve($relay, $handler, $children = 0)` | listen on `unix:/path` or `host:port`, fork per connection, block |
+| `Supervisor::listen($relay)` | bind only, for an application that owns its own accept loop |
+| `Supervisor::relayPath($relay)` | the path of a `unix:` relay, or `null` for a TCP one |
+| `Supervisor::UNIX_PREFIX` | `'unix:'` — volucer's convention, not PHP's |
 
 `recycle()` is what an application calls when it has put itself into a state it cannot clean up —
 a leaked global, a stuck connection, a fat static cache. The server sees `keep_alive = false` in
@@ -254,10 +355,21 @@ REQUEST frames into a live `php worker.php` and reads the RESPONSE back, so both
 are held to the same wire format with a real process in between. They skip themselves, with a
 printed reason, when no `php` is on `PATH`.
 
+[`example/supervisor.php`](example/supervisor.php) is a runnable supervisor, so the two files can be
+compared directly:
+
+```bash
+php example/supervisor.php unix:/tmp/workers.sock
+```
+
+It serves `/`, `/health` and `/boom` (which throws, to show that one failing request does not take
+the supervisor with it). `/health` reports the pid and how long ago the master booted — ask it twice
+and you get two pids and the same boot time, which is the fork working.
+
 ## Tests
 
 ```bash
-php tests/run.php          # 124 assertions, no PHPUnit needed
+php tests/run.php          # 410 assertions, no PHPUnit needed
 ```
 
 - `tests/WireFormatTest.php` pins the header layout, CRC-32C and the **exact golden bytes** —
@@ -266,6 +378,13 @@ php tests/run.php          # 124 assertions, no PHPUnit needed
   either implementation drifts, one of the two suites fails.
 - `tests/WorkerTest.php` drives a `Worker` over in-memory streams: output capture, chunking,
   request bodies, control frames, error recovery, and the framing failures.
+- `tests/SupervisorTest.php` runs a **real supervisor** and speaks the protocol to it over a real
+  `AF_UNIX` socket, because every failure mode `Supervisor` has is a process failure: a child that
+  inherits the listener and never closes it, a child that never exits so the slot never comes back,
+  a zombie per connection, a socket file left behind for the next start. It also covers the recycle
+  race — a peer that sends `CONTROL drain` and closes without reading the ack, which is what
+  `Slot::stop()` does on every attached recycle. The fork half is skipped on Windows, where `pcntl`
+  does not exist; the pure half (`relayPath()`, the argument checks, the refusal) runs everywhere.
 
 Running the suite prints a `WARNING-MARKER` line on stderr. That is the mechanism working, not a
 failure: the warning went to stderr instead of into a frame.
@@ -282,6 +401,10 @@ failure: the warning went to stderr instead of into a frame.
   option below turned on, the frame codec skips the hash entirely; nothing else in the SDK uses
   `ext-hash`, so a deployment that always turns it off could in principle drop the extension.
 - `ext-json`.
+- **ext-pcntl**, for `Volucer\Supervisor` only. `Worker` needs nothing beyond `ext-hash` and
+  `ext-json`, and a `worker` backend needs no extension at all; the supervisor is the one part that
+  cannot exist without `fork()`, and it says so rather than degrading to one process when the
+  extension is missing.
 
 The protocol version is `1`. A worker and a server that disagree are caught at the handshake
 rather than on the first request.

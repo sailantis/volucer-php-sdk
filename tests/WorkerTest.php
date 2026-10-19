@@ -649,6 +649,20 @@ $reportedMetrics = json_of($reported['frames'], MessageType::METRIC);
 Assert::same(1, count($reportedMetrics), 'a report answers with one metric');
 Assert::same('worker_peak_memory_bytes', $reportedMetrics[0]['name'], 'the report names its metric');
 
+/*
+ * A drain whose ack cannot be written is a clean stop, not a failure.
+ *
+ * This is the `attach` recycle path, and it is not hypothetical: `Slot::stop()` in the server sends
+ * `CONTROL drain` and then closes the connection *without* reading the answer, so on every recycled
+ * slot the worker's `CONTROL_ACK` lands on a closed socket. Before this was tolerant, that cost one
+ * notice plus one `worker exited:` line per recycle, and the child exited non-zero — the pool saw a
+ * failed worker where the protocol had done exactly what it promised.
+ *
+ * It is covered by `SupervisorTest` instead of here, because reproducing it needs a *peer that
+ * closes after sending*, and every in-memory fixture either fails earlier (at the `HELLO_ACK`) or
+ * proves nothing about `EPIPE`.
+ */
+
 // ------------------------------------------------------------- stream errors
 
 // A truncated payload is a framing failure, not a clean close.
