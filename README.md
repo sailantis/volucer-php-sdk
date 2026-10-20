@@ -43,8 +43,20 @@ stdin/stdout rather than HTTP — point volucer at it, or see
 
 `Worker::connect()` is `Worker::create()` with one extra step: when the server has set
 `VOLUCER_WORKER_SOCKET` — which it does on the `socket` transport, **the default on Windows** —
-the protocol runs over that loopback socket instead of stdio. Use `connect()` in a worker that a
+the protocol runs over that socket instead of stdio. Use `connect()` in a worker that a
 `volucer` backend starts, and `create()` when you are binding streams yourself.
+
+The variable carries either form, and `connect()` decides from its prefix:
+
+| value | transport |
+| --- | --- |
+| `127.0.0.1:34567` | loopback TCP — the ephemeral port the server bound |
+| `unix:/run/volucer/worker.0.sock` | a unix socket, from `socket = "unix:/run/volucer/worker"` |
+
+`unix:` is the same convention the server's configuration uses for `external`, `attach` and the
+worker `socket` key, so there is one spelling rather than a fourth. Nothing else in a worker
+changes: `Worker::unixPath()` is the whole of the decision, and it returns `null` for a TCP
+address so the connection code has one branch.
 
 This is not cosmetic on Windows. A worker that calls `create()` cannot read a socket, so under
 the default transport it reads `php://stdin` — which the server has set to end-of-file — and exits
@@ -272,7 +284,7 @@ $response->withStatus(201)->withHeader('X-Trace', 'abc')->withBody('…');
 | Method | Purpose |
 | --- | --- |
 | `Worker::create($in?, $out?)` | bind explicit streams (default: stdio), force `display_errors=stderr` |
-| `Worker::connect()` | `create()`, but honour `VOLUCER_WORKER_SOCKET` when the server sets it |
+| `Worker::connect()` | `create()`, but honour `VOLUCER_WORKER_SOCKET` when the server sets it (either `host:port` or `unix:/path`) |
 | `run($handler)` | handshake, then serve until EOF |
 | `emitLog($message, $level)` | one log record, unsolicited |
 | `emitMetric($name, $value, $unit)` | one metric sample, unsolicited. `$name` must be a Prometheus name (`[a-zA-Z_][a-zA-Z0-9_]*`) and declared in the server's `[metrics.collect]` |

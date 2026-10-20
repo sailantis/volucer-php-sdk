@@ -854,6 +854,36 @@ Assert::same(
 );
 
 /**
+ * A `unix:` address is a path, and a TCP address is not.
+ *
+ * This is the whole of the transport decision on the worker side: `connect()` branches on
+ * `unixPath()` and nothing else. The interesting cases are about the *string* — a prefix that
+ * is absent, present, or present with nothing after it — so they are tested without a socket,
+ * for the same reason `socketAddress` is.
+ *
+ * `unix:` with no path returns `''` rather than `null`, deliberately: `null` means "use stdio",
+ * and a server that sent `unix:` sent a broken address, not an instruction to fall back. The
+ * connection then fails and says so on stderr, which is the only channel a worker has.
+ */
+function unix_paths(): array
+{
+    return [
+        ['unix:/run/volucer/worker.0.sock', '/run/volucer/worker.0.sock'],
+        ['127.0.0.1:18400', null],
+        ['localhost:9000', null],
+        ['unix:', ''],
+    ];
+}
+
+foreach (unix_paths() as [$given, $want]) {
+    Assert::same(
+        $want,
+        Worker::unixPath($given),
+        "the unix path of $given is the filesystem path or nothing",
+    );
+}
+
+/**
  * A `CALL` from the server is answered, and the request it interrupted still completes.
  *
  * The frames go in as: a `CALL` mid-response, then the rest of the response. The frame order is the

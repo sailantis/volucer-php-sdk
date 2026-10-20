@@ -318,6 +318,15 @@ final class Worker
     public const SOCKET_ENV = 'VOLUCER_WORKER_SOCKET';
 
     /**
+     * The prefix volucer's configuration uses for a unix socket address.
+     *
+     * The same string `Supervisor::UNIX_PREFIX` holds, and deliberately a separate constant:
+     * the two are read in different directions (a worker dials, a supervisor listens) and one
+     * of them moving without the other is a bug worth being able to see.
+     */
+    public const UNIX_PREFIX = 'unix:';
+
+    /**
      * How long to wait for the server to accept the connection.
      *
      * Generous on purpose: the server binds its listener *before* spawning the worker, so
@@ -372,15 +381,22 @@ final class Worker
             return self::create();
         }
 
+        $unix = self::unixPath($address);
+
+        // The wrapper, not an `if` around two calls: `unix://` and `tcp://` differ in the
+        // URL and in whether a context means anything, so building the pair once is what
+        // keeps a unix socket from silently receiving `tcp_nodelay`, which is `ENOPROTOOPT`
+        // on an `AF_UNIX` socket and is only ignored because the return value is not checked.
+        //
         // `@` because the warning duplicates the message below, which is also written to
         // stderr — and on the socket transport stderr is the only channel the server sees.
         $stream = @stream_socket_client(
-            'tcp://' . $address,
+            $unix === null ? 'tcp://' . $address : 'unix://' . $unix,
             $errno,
             $errstr,
             self::CONNECT_TIMEOUT,
             STREAM_CLIENT_CONNECT,
-            self::socketContext(),
+            $unix === null ? self::socketContext() : null,
         );
 
         if ($stream === false) {
@@ -393,6 +409,27 @@ final class Worker
         }
 
         return self::create($stream, $stream);
+    }
+
+    /**
+     * The filesystem path of a `unix:` address, or `null` for a TCP one.
+     *
+     * The `unix:` prefix is volucer's own convention, and it appears in three other places
+     * already — `external`'s `socket`, `attach`'s `relay` and the worker `socket` key — so
+     * reading it here is the same rule rather than a fourth spelling. A loopback TCP address
+     * is `host:port` and has no prefix, which is why the absence of one is the whole test.
+     *
+     * Split out so the decision is testable without a socket, for the same reason
+     * [`Worker::socketAddress`] is: the interesting cases are about the *string*, and a test
+     * that needs a live listener can only cover one of them.
+     */
+    public static function unixPath(string $address): ?string
+    {
+        if (!str_starts_with($address, self::UNIX_PREFIX)) {
+            return null;
+        }
+
+        return substr($address, strlen(self::UNIX_PREFIX));
     }
 
     /**
