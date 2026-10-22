@@ -37,13 +37,13 @@ use Volucer\Response;
 use Volucer\Supervisor;
 use Volucer\Worker;
 
-$relay = $argv[1] ?? '';
+$relay = Supervisor::relay($argv[1] ?? '');
 
-if ($relay === '' && Supervisor::relay() === null) {
+if ($relay === null) {
     fwrite(
         STDERR,
         "usage: php example/supervisor.php [unix:/path/to.sock|host:port]\n"
-        . 'or set ' . Supervisor::RELAY_ENV . " to the same relay the server's `relay` names\n",
+            . 'or set ' . Supervisor::RELAY_ENV . " to the same relay the server's `relay` names\n",
     );
     exit(2);
 }
@@ -77,8 +77,8 @@ $handler = static function (Request $request, Worker $worker) use ($startedAt): 
     // each child serves one connection and exits.
     if ($path === '/health') {
         return Response::json([
-            'status' => 'ok',
-            'pid' => getmypid(),
+            'status'             => 'ok',
+            'pid'                => getmypid(),
             'booted_seconds_ago' => round(microtime(true) - $startedAt, 3),
         ]);
     }
@@ -97,5 +97,5 @@ $handler = static function (Request $request, Worker $worker) use ($startedAt): 
     return null;
 };
 
-// An empty string reaches `serve()` as "absent", which is where `VOLUCER_RELAY_SOCKET` is read.
-Supervisor::serve($relay === '' ? null : $relay, $handler);
+// `relay()` has already resolved the argument against `VOLUCER_RELAY_SOCKET`, so this is an address.
+Supervisor::serve($relay, $handler);

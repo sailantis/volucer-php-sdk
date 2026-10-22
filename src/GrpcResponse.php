@@ -18,7 +18,7 @@ namespace Volucer;
  * never parses or re-frames it, so a handler owns the framing entirely — write the compression flag
  * and the big-endian length yourself, or let whatever protobuf library you already use write it. This
  * SDK does not ship an encoder, because doing so would put a schema in the transport, which is the
- * whole of `docs/plugins.md` §6.6's position.
+ * whole of `internal/plugins.md` §6.6's position.
  *
  * The exception is [`GrpcResponse::fail`], where the message is a *sentence for a developer* rather
  * than a message for the wire: a failed call has no payload, and gRPC's own convention is that
@@ -71,7 +71,7 @@ final class GrpcResponse
      * The name says what the argument is: the framed bytes the *client* will decode — a compression
      * flag, a big-endian length, then the message. Callers usually reach for this through a helper of
      * their own that encodes a protobuf message; the transport does not ship one, because shipping one
-     * would put a schema in the transport (`docs/plugins.md` §6.6).
+     * would put a schema in the transport (`internal/plugins.md` §6.6).
      */
     public static function message(string $payload, string $contentType = 'application/grpc+proto'): self
     {

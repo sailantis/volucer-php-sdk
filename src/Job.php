@@ -17,7 +17,7 @@ namespace Volucer;
  * an application's retry policy is built from the last one and its logs are read by the second.
  *
  * What is *not* here is the payload's meaning. The server never parses it and never will — see
- * `docs/plugins.md` §6.4 — so [`Job::$payload`] is the bytes that were pushed, and how they were
+ * `internal/plugins.md` §6.4 — so [`Job::$payload`] is the bytes that were pushed, and how they were
  * serialized is between the producer and the handler. `json_decode` is the common case and is not
  * this class's business.
  *

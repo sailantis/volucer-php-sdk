@@ -1042,7 +1042,7 @@ final class Worker
      * refused, and never appears — so a dot here is a sample that silently does nothing.
      *
      * The name also has to be declared by the deployment in `[metrics.collect]` before it is
-     * accepted; see `docs/plugins.md` §6.1. A server refuses an undeclared name on purpose, so that
+     * accepted; see `internal/plugins.md` §6.1. A server refuses an undeclared name on purpose, so that
      * an application cannot widen the published set at runtime.
      */
     public function emitMetric(string $name, float $value, string $unit = ''): void
@@ -1320,7 +1320,7 @@ final class Worker
      * waiting here is waiting for a frame that is already on its way. A timeout would need
      * `stream_select`, which is meaningless on a Windows pipe, and it would put the deadline in the
      * wrong place: the server is the side that knows how long a backend may take, and §4.2 of
-     * `docs/plugins.md` puts the per-call deadline *inside the handler* for exactly that reason. Reading
+     * `internal/plugins.md` puts the per-call deadline *inside the handler* for exactly that reason. Reading
      * as the main loop reads also means a timeout cannot leave half a frame in a buffer.
      *
      * @return mixed
@@ -1761,7 +1761,7 @@ final class Worker
      *
      * **This is *not* the direction `Worker::call()` uses.** That one is the application asking the
      * *server* for something mid-request (`kv.get`, `lock.acquire`); this one is the server delivering
-     * a unit of work. They share the channel and nothing else, and `docs/plugins.md` §4.3 is where the
+     * a unit of work. They share the channel and nothing else, and `internal/plugins.md` §4.3 is where the
      * distinction is written down.
      *
      * @param callable(Request, self): (GrpcResponse|string|null) $handler
