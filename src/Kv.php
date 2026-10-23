@@ -158,7 +158,7 @@ final class Kv
      *
      * This is the primitive a lock cannot be. A TTL lock has no fencing token, so a worker that stalls
      * past its deadline can be inside a section somebody else has entered — the server says so at
-     * [Worker::lock](../README.md) and in `internal/plugins.md` §9.2. Where a real invariant is at stake, the
+     * [Worker::lock](../README.md) and in its own documentation. Where a real invariant is at stake, the
      * storage decides instead: `true` means this call's value is the one under the key, `false` means
      * somebody else's already was, and **`false` is a success** — a caller that treats it as a failure
      * retries a write that was correctly refused.

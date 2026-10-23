@@ -14,7 +14,7 @@ namespace Volucer;
  *
  * - **No `Options` object.** RoadRunner's `Options` carries `autoAck`, `delay` and driver-specific keys
  *   in one mutable thing; this client has none of them, because the server has none: `autoAck` is the
- *   consumer's business (`internal/plugins.md` §6.4), `delay` needs a driver with a scheduler and no driver
+ *   consumer's business, `delay` needs a driver with a scheduler and no driver
  *   here has one, and a driver-specific option would make this class depend on which driver a deployment
  *   chose.
  * - **The payload is a string, and it is the caller's to serialize.** Exactly as RoadRunner's is: "The
@@ -29,7 +29,7 @@ namespace Volucer;
  * omission. A reservation's lease starts ticking the moment a job is handed out, and this class is used
  * from inside a *request* — so a job reserved here would be held by a worker that is already busy with
  * something else while its lease ran down. A consumer is a different process, started from
- * `[jobs.pool]`, and it reserves through its own channel; see `internal/plugins.md` §6.4.
+ * `[jobs.pool]`, and it reserves through its own channel.
  */
 final class Jobs
 {

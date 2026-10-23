@@ -37,7 +37,7 @@ $worker = Worker::connect();
 // The gRPC half, registered before the loop starts. A call is identified by its *content type*, so one
 // process serves both protocols and this only decides who answers a call — see `Worker::onGrpc`.
 //
-// The server never parses a message (`internal/plugins.md` §6.6), so this handler frames its own reply:
+// The server never parses a message, so this handler frames its own reply:
 // gRPC's message framing is one compression flag byte, a big-endian `u32` length, then that many bytes.
 // A real application would let a protobuf library write that; here it is written out so the test has
 // something to assert on and so the framing is visible.

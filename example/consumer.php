@@ -36,7 +36,7 @@ declare(strict_types=1);
  * ## The retry policy is the application's
  *
  * `$job->attempts` counts reservations, starting at 1, and the server imposes no limit, no backoff and
- * no dead-lettering — see `internal/plugins.md` §6.4 of `sailantis/volucer` for why. So the policy is
+ * no dead-lettering — that is the application's policy to write. So the policy is
  * written here, in the one place an application can see it:
  *
  * ```php
