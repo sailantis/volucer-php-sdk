@@ -194,6 +194,21 @@ are inherited by every child, which is the saving. An *open database connection*
 child would inherit the socket and they would take turns reading from it. Open connections lazily,
 per child, on the first request — doctrine's `EntityManager` and PDO both do this already.
 
+**If your PHP loads `grpc`, start the supervisor with `GRPC_ENABLE_FORK_SUPPORT=1`.** grpc starts an
+executor, a resolver and a timer thread at module init, and a `fork()` after that inherits locks no
+surviving thread will release — so the child deadlocks inside `exit()`, inside grpc's own module
+shutdown. It does not crash: it stays in state `S` for ever, `SIGCHLD` never fires, the master never
+reaps it, and a supervisor with a `children` cap stops accepting once the cap is reached. Measured
+on a CLI PHP that loads grpc: nine stuck children after eight recycles, and none with the variable
+set. It has to be an environment variable — not `-d grpc.enable_fork_support=1`, and not
+`putenv()` from PHP, which is the first thing worth trying and does not work: grpc starts those
+threads in its module init, before any script runs. `Supervisor::grpcForkHazard()` reports the
+state and `serve()` warns about it, but neither can undo it.
+
+```bash
+GRPC_ENABLE_FORK_SUPPORT=1 php worker.php       # or Environment= in a unit file
+```
+
 ### Writing a supervisor yourself
 
 `Supervisor::serve()` is a convenience, not the contract. What `attach` needs from any supervisor is
@@ -302,6 +317,7 @@ the server opened, and `Supervisor` serves many, forking one child each. See
 | `Supervisor::serve($relay, $handler, $children = 0)` | listen on `unix:/path` or `host:port`, fork per connection, block |
 | `Supervisor::listen($relay)` | bind only, for an application that owns its own accept loop |
 | `Supervisor::relayPath($relay)` | the path of a `unix:` relay, or `null` for a TCP one |
+| `Supervisor::grpcForkHazard()` | why a forking PHP will stall, or `null` — see [the grpc note](#attaching-instead-of-spawning) |
 | `Supervisor::UNIX_PREFIX` | `'unix:'` — volucer's convention, not PHP's |
 
 `recycle()` is what an application calls when it has put itself into a state it cannot clean up —

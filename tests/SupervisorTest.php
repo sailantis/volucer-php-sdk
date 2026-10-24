@@ -38,6 +38,60 @@ Assert::same('/run/app.sock', Supervisor::relayPath('  unix:/run/app.sock  '), '
 Assert::same(null, Supervisor::relayPath('127.0.0.1:9700'), 'a TCP relay has no path');
 Assert::same('', Supervisor::relayPath('unix:'), 'unix: with no path is an empty path, not a TCP one');
 
+// ------------------------------------------- the forking hazard grpc introduces
+
+/*
+ * `grpc` starts an executor, a resolver and a timer thread when its module initialises, and a
+ * `fork()` after that inherits locks no surviving thread will release: the child deadlocks in
+ * `exit()`, stays in state `S`, and never fires `SIGCHLD`. Measured on a machine whose CLI PHP
+ * loads grpc — nine stuck children after eight recycles, none with the variable set.
+ *
+ * The assertion is conditional on grpc actually being loaded, because on a PHP without it the
+ * hazard cannot arise and a test that demanded the message would fail for the right reason on the
+ * wrong machine. What is asserted unconditionally is the other half: a variable that reports the
+ * opt-in silences it.
+ */
+if (!extension_loaded('grpc')) {
+    Assert::same(null, Supervisor::grpcForkHazard(), 'no grpc means no hazard, whatever the environment says');
+} else {
+    $previousFork = getenv('GRPC_ENABLE_FORK_SUPPORT');
+    $setFork = static function (?string $value): void {
+        putenv($value === null ? 'GRPC_ENABLE_FORK_SUPPORT' : 'GRPC_ENABLE_FORK_SUPPORT=' . $value);
+    };
+
+    try {
+        $setFork(null);
+        Assert::contains(
+            'GRPC_ENABLE_FORK_SUPPORT=1',
+            (string) Supervisor::grpcForkHazard(),
+            'unset: the hazard is reported, and the message names the variable to set',
+        );
+
+        // Only the three spellings grpc itself accepts as "on" silence the report. An empty value
+        // and `0` mean "off", which is the state that stalls — treating them as consent was my
+        // first version of this assertion, and it would have hidden the very hazard it tests for.
+        foreach (['', '0'] as $off) {
+            $setFork($off);
+            Assert::contains(
+                'GRPC_ENABLE_FORK_SUPPORT=1',
+                (string) Supervisor::grpcForkHazard(),
+                sprintf('"%s" means off, so the hazard must still be reported', $off),
+            );
+        }
+
+        foreach (['1', 'true', 'yes'] as $on) {
+            $setFork($on);
+            Assert::same(
+                null,
+                Supervisor::grpcForkHazard(),
+                sprintf('"%s" is grpc\'s opt-in, so there is no hazard left to report', $on),
+            );
+        }
+    } finally {
+        $setFork($previousFork === false ? null : $previousFork);
+    }
+}
+
 // ------------------------------------------- where the relay address comes from
 
 /*
@@ -181,10 +235,19 @@ function supervisor_start(string $dir, int $cap): array
     // stderr goes to a *file* rather than a pipe: the supervisor outlives each test section, so a
     // pipe would have to be drained concurrently to avoid blocking on a full buffer, and the tests
     // that assert on it would have to know when to stop reading. A file has neither problem.
+    //
+    // `GRPC_ENABLE_FORK_SUPPORT=1` is the hazard `Supervisor::grpcForkHazard()` reports: grpc starts
+    // an executor thread at module init, a `fork()` after that inherits its locks, and the child
+    // deadlocks in `exit()` — so it stays in `S` and is never reaped. Inheriting the environment is
+    // not enough, because the machine this was measured on has the variable unset and grpc loaded,
+    // which is exactly the state a deployment would be in.
+    $environment = array_merge($_ENV, ['GRPC_ENABLE_FORK_SUPPORT' => '1']);
     $process = proc_open(
         [PHP_BINARY, $script, __DIR__ . '/../autoload.php', 'unix:' . $relayPath, $log, (string) $cap],
         [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['file', $dir . '/supervisor.err', 'w']],
         $pipes,
+        null,
+        $environment,
     );
 
     if (!is_resource($process)) {

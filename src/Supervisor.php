@@ -44,6 +44,34 @@ namespace Volucer;
  * container, loaded classes, the OPcache segment — so build it before calling `serve()`. What must
  * *not* be built before the fork is an open connection: every child would inherit it and they would
  * take turns reading from it. Open those per child, lazily, on the first request.
+ *
+ * **A PHP that loads `grpc` must be started with `GRPC_ENABLE_FORK_SUPPORT=1`.**
+ *
+ * `grpc` starts an executor, a resolver and a timer thread when its module initialises. A `fork()`
+ * after that inherits those threads' locks, and the child deadlocks the first time it calls
+ * `exit()` — inside grpc's own module shutdown. The symptom is not a crash: the child stays in
+ * state `S` on a futex for ever, so `SIGCHLD` never fires, the master never reaps it, and a
+ * supervisor that caps `children` stops accepting. Measured on a machine whose CLI PHP loads grpc:
+ * nine stuck children after eight recycles, and none with the variable set.
+ *
+ * It has to be an environment variable, not `-d grpc.enable_fork_support=1` and not `putenv()` from
+ * PHP: grpc starts those threads in its module init, which runs before any script does, so a value
+ * set from PHP changes what `--ri grpc` reports and nothing else. Measured — `putenv()` at the top
+ * of the script still leaves the child stuck (`exit()` never returns), while the same variable in
+ * the environment lets it exit and be reaped.
+ *
+ * ```ini
+ * # worker.service
+ * Environment=GRPC_ENABLE_FORK_SUPPORT=1
+ * ```
+ *
+ * ```bash
+ * GRPC_ENABLE_FORK_SUPPORT=1 php supervisor.php    # or in the container's environment
+ * ```
+ *
+ * `Supervisor::serve()` cannot do this for you, because the threads already exist by the time any
+ * PHP code runs. It reports the hazard in {@see Supervisor::grpcForkHazard()} so a caller can log
+ * it rather than discover it as a stalled pool.
  */
 final class Supervisor
 {
@@ -247,6 +275,13 @@ final class Supervisor
                 . 'variable the server reads for its `relay`, e.g. "unix:/run/app/workers.sock"',
                 self::RELAY_ENV,
             ));
+        }
+
+        // Warned rather than refused: the hazard shows up as a stalled pool under load, and
+        // taking a serving deployment down for it would be the worse answer. See the method.
+        $hazard = self::grpcForkHazard();
+        if ($hazard !== null) {
+            @fwrite(STDERR, '[volucer] warning: ' . $hazard . "\n");
         }
 
         $limit = $children > 0 ? $children : null;
@@ -486,6 +521,39 @@ final class Supervisor
                 $function,
             ));
         }
+    }
+
+    /**
+     * The reason a forking PHP will stall, if one applies here, or `null`.
+     *
+     * `grpc` starts an executor, a resolver and a timer thread when its module initialises, and a
+     * `fork()` after that inherits locks no surviving thread will release. The child deadlocks in
+     * `exit()` — inside grpc's module shutdown — and stays in state `S`, so `SIGCHLD` never fires
+     * and the master never reaps it. Measured: nine stuck children after eight recycles with the
+     * hazard present, none with `GRPC_ENABLE_FORK_SUPPORT=1` in the environment.
+     *
+     * `serve()` calls this and warns on stderr rather than throwing, because the failure is a
+     * stall under load rather than a broken start-up: refusing to start would take a working
+     * deployment down on a warning. It is public so a caller can turn it into a hard failure
+     * where a stalled pool is worse than no server.
+     */
+    public static function grpcForkHazard(): ?string
+    {
+        if (!\extension_loaded('grpc')) {
+            return null;
+        }
+
+        // grpc's own opt-in for a process that forks. It has to be an environment variable: the
+        // `grpc.enable_fork_support` ini setting is read after the threads already exist, so an
+        // `-d` flag reports the requested value and changes nothing.
+        $enabled = getenv('GRPC_ENABLE_FORK_SUPPORT');
+        if ($enabled !== false && $enabled !== '' && $enabled !== '0') {
+            return null;
+        }
+
+        return 'this PHP loads grpc and GRPC_ENABLE_FORK_SUPPORT is not set, so every forked child '
+            . 'will deadlock in exit() and never be reaped; start the supervisor with '
+            . 'GRPC_ENABLE_FORK_SUPPORT=1 in its environment, or run it on a PHP without grpc';
     }
 
     /** Load the SDK's own classes before the fork, so no child compiles them for itself. */
