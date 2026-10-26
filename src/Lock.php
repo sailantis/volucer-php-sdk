@@ -46,12 +46,12 @@ namespace Volucer;
  */
 final class Lock
 {
-    /** @var Worker the worker this lock plane is reached through */
-    private Worker $worker;
+    /** @var CallPlane whatever answers a call: a worker's channel, or the `[rpc]` listener */
+    private CallPlane $calls;
 
-    public function __construct(Worker $worker)
+    public function __construct(CallPlane $calls)
     {
-        $this->worker = $worker;
+        $this->calls = $calls;
     }
 
     /**
@@ -249,15 +249,17 @@ final class Lock
     private function ask(string $verb, array $params): array
     {
         $name = 'lock.' . $verb;
-        $answer = $this->worker->call($name, $params);
+        $answer = $this->calls->call($name, $params);
 
-        $error = $this->worker->lastCallError();
+        $error = $this->calls->lastCallError();
         if ($error !== null) {
+            // `"%s failed"`, not "the server refused": see `Kv::ask()` for why a call can fail before
+            // it reaches the server at all.
             throw new ProtocolException(sprintf(
-                'the server refused %s: %s%s',
+                '%s failed: %s%s',
                 $name,
                 $error,
-                $this->worker->lastCallWasUnknown()
+                $this->calls->lastCallWasUnknown()
                     ? ' (and the lock state is unknown, so ask exists() before deciding what it means)'
                     : '',
             ));

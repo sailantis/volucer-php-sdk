@@ -7,10 +7,10 @@ namespace Volucer;
 /**
  * Key-value storage, as the server holds it.
  *
- * One instance per storage, obtained from {@see Worker::kv()}. The shape is PSR-16's, because that is
- * what an application already knows and what every other cache in PHP-land speaks — but this is not a
- * PSR-16 *implementation* and does not pretend to be one. The differences are deliberate and each is
- * worth knowing:
+ * One instance per storage, obtained from {@see Worker::kv()} or {@see Rpc::kv()}. The shape is
+ * PSR-16's, because that is what an application already knows and what every other cache in PHP-land
+ * speaks — but this is not a PSR-16 *implementation* and does not pretend to be one. The differences
+ * are deliberate and each is worth knowing:
  *
  * - **No `getMultiple` key-returning form.** PSR-16's `getMultiple` returns an array keyed by the keys
  *   it found, which loses the distinction between a key that is absent and one whose value is `null`
@@ -31,8 +31,8 @@ namespace Volucer;
  */
 final class Kv
 {
-    /** @var Worker the worker this storage is reached through */
-    private Worker $worker;
+    /** @var CallPlane whatever answers a call: a worker's channel, or the `[rpc]` listener */
+    private CallPlane $calls;
 
     /** @var string the storage's configured name, e.g. "sessions" */
     private string $storage;
@@ -60,13 +60,13 @@ final class Kv
      * @param callable(mixed): string|null $encode
      * @param callable(string): mixed|null $decode
      */
-    public function __construct(Worker $worker, string $storage, ?callable $encode = null, ?callable $decode = null)
+    public function __construct(CallPlane $calls, string $storage, ?callable $encode = null, ?callable $decode = null)
     {
         if ($storage === '') {
             throw new \InvalidArgumentException('a kv storage must be named: the server refuses a call that does not say which one');
         }
 
-        $this->worker = $worker;
+        $this->calls = $calls;
         $this->storage = $storage;
         $this->encode = $encode ?? static fn (mixed $value): string => json_encode(
             $value,
@@ -343,15 +343,20 @@ final class Kv
      */
     private function ask(string $name, array $params = []): array
     {
-        $answer = $this->worker->call($name, $params);
+        $answer = $this->calls->call($name, $params);
 
-        $error = $this->worker->lastCallError();
+        $error = $this->calls->lastCallError();
         if ($error !== null) {
+            // `"%s failed"` rather than `"the server refused %s"`, and the difference is one a
+            // worker's channel could not produce: over `[rpc]`, a call can fail *before it is sent* —
+            // a deployment that granted this backend no `services` hands it no address at all — and
+            // an operator reading "the server refused" would go looking at the server's log for a
+            // request it never received. The reason string says which case it was.
             throw new ProtocolException(sprintf(
-                'the server refused %s: %s%s',
+                '%s failed: %s%s',
                 $name,
                 $error,
-                $this->worker->lastCallWasUnknown()
+                $this->calls->lastCallWasUnknown()
                     ? ' (and the call may have taken effect, so retrying it is not necessarily safe)'
                     : '',
             ));

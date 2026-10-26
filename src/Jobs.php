@@ -33,19 +33,19 @@ namespace Volucer;
  */
 final class Jobs
 {
-    /** @var Worker the worker this queue is pushed through */
-    private Worker $worker;
+    /** @var CallPlane whatever answers a call: a worker's channel, or the `[rpc]` listener */
+    private CallPlane $calls;
 
     /** @var string the pipeline's configured name */
     private string $pipeline;
 
-    public function __construct(Worker $worker, string $pipeline)
+    public function __construct(CallPlane $calls, string $pipeline)
     {
         if ($pipeline === '') {
             throw new \InvalidArgumentException('a queue must name a pipeline: the server refuses a push that does not say which one');
         }
 
-        $this->worker = $worker;
+        $this->calls = $calls;
         $this->pipeline = $pipeline;
     }
 
@@ -210,12 +210,14 @@ final class Jobs
     {
         $name = 'jobs.' . $verb;
         $answer = $params === []
-            ? $this->worker->call($name)
-            : $this->worker->call($name, $params);
+            ? $this->calls->call($name)
+            : $this->calls->call($name, $params);
 
-        $error = $this->worker->lastCallError();
+        $error = $this->calls->lastCallError();
         if ($error !== null) {
-            throw new ProtocolException(sprintf('the server refused %s: %s', $name, $error));
+            // `"%s failed"`, not "the server refused": see `Kv::ask()` for why a call can fail before
+            // it reaches the server at all.
+            throw new ProtocolException(sprintf('%s failed: %s', $name, $error));
         }
 
         return is_array($answer) ? $answer : [];

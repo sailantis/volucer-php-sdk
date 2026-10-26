@@ -50,7 +50,7 @@ namespace Volucer;
  * no signal to catch and no flag to poll, which is why the server only needs to
  * kill the process after a grace period rather than to ask nicely twice.
  */
-final class Worker
+final class Worker implements CallPlane
 {
     /** The largest body slice sent in one frame, matching MAX_BODY_CHUNK in Rust. */
     public const MAX_BODY_CHUNK = 65536;

@@ -1455,8 +1455,8 @@ $refused = (function () use ($fixture) {
 })();
 
 Assert::true(
-    is_string($refused) && str_contains($refused, 'refused'),
-    'a refused call must raise rather than return a value that reads as a cache miss',
+    is_string($refused) && str_contains($refused, 'kv.secrets.get failed'),
+    'a refused call must raise rather than return a value that reads as a cache miss: ' . var_export($refused, true),
 );
 Assert::true(
     str_contains((string) $refused, 'sessions'),
@@ -1659,7 +1659,7 @@ $refusedLock = (function () {
 })();
 
 Assert::true(
-    is_string($refusedLock['message']) && str_contains($refusedLock['message'], 'refused'),
+    is_string($refusedLock['message']) && str_contains($refusedLock['message'], 'lock.acquire failed'),
     'an acquisition the server could not decide must raise rather than return null: ' . var_export($refusedLock['message'], true),
 );
 Assert::true(

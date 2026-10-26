@@ -305,6 +305,53 @@ $response->withStatus(201)->withHeader('X-Trace', 'abc')->withBody('…');
 | `emitMetric($name, $value, $unit)` | one metric sample, unsolicited. `$name` must be a Prometheus name (`[a-zA-Z_][a-zA-Z0-9_]*`) and declared in the server's `[metrics.collect]` |
 | `recycle()` | ask the server to replace this worker after the request |
 | `currentRequestId()` | the in-flight request id, for telemetry correlation |
+| `kv($storage = 'default')` | a handle to a key-value storage — see `docs/08-SERVICES.md` in the server |
+| `lock()` | a handle to the resource locks |
+| `queue($pipeline)` | a handle to a queue, from the producer's side |
+
+### `Rpc`
+
+The call plane for an application that has **no worker channel** — a `php-fpm` or `php-cgi`
+deployment behind volucer, which exists for one request and can only answer what it was handed. It
+speaks the same frames to volucer's `[rpc]` listener, so `Kv`, `Lock` and `Jobs` work unchanged over
+either transport; both implement the three-method `CallPlane` interface those clients are written
+against.
+
+```php
+$rpc = Rpc::connect();                  // reads VOLUCER_RPC / VOLUCER_RPC_TOKEN
+
+$rpc->kv('cache')->set('greeting', 'hello');
+$id = $rpc->lock()->acquire('pdf:create');
+$rpc->queue('mail')->push('{"to":"a@b"}');
+```
+
+| Method | Purpose |
+| --- | --- |
+| `Rpc::connect($address?, $token?, $timeout?)` | build one, from the request's environment unless overridden |
+| `call($name, $params)` | one round trip |
+| `kv()`, `lock()`, `queue()` | the same handles `Worker` returns |
+| `lastCallError()`, `lastCallWasUnknown()` | why a call failed, and whether it may have taken effect |
+| `close()` | drop the socket; the next call reconnects |
+| `address()` | which call plane this is, for a diagnostic |
+
+**Nothing has to be configured on this side.** The address and the backend's identity are put into
+the request by volucer — `VOLUCER_RPC` and `VOLUCER_RPC_TOKEN` as CGI parameters, or
+`X-Volucer-Rpc` and `X-Volucer-Rpc-Token` as headers for an `upstream` origin. A backend whose
+`services` list is empty is handed neither, and gets a refused call naming the missing variable
+rather than an unexplained failure.
+
+Two consequences of the transport are worth knowing, and both differ from `Worker`:
+
+- **A call has a deadline.** `Worker::call()` blocks with none, because the protocol guarantees an
+  answer and a timeout on a Windows pipe would need `stream_select`, which is meaningless there.
+  This client reads a *socket*, so `Rpc::connect(timeout: 30.0)` works and matters: a call that
+  legitimately takes longer than the default 10 s — a `lock()->acquire()` with a long `$wait` — needs
+  a deadline that covers it. `[rpc].call_timeout_seconds` is the *server's* write deadline and does
+  not govern how long you may wait.
+- **`lastCallWasUnknown()` is reachable on a path a worker never has.** A connection that breaks or
+  times out after the call was written may still have been served; a connection that was never
+  established certainly was not. The client distinguishes them, so a retry is a decision rather than
+  a gamble.
 
 ### `Supervisor`
 
@@ -409,6 +456,11 @@ It serves `/`, `/health` and `/boom` (which throws, to show that one failing req
 the supervisor with it). `/health` reports the pid and how long ago the master booted — ask it twice
 and you get two pids and the same boot time, which is the fork working.
 
+[`example/rpc.php`](example/rpc.php) is the third shape: a plain script served by `php-cgi`, which
+reaches the same services through `[rpc]` instead of a channel. The TOML it needs is in its own
+header comment. Its `/rpc.php/cache`, `/rpc.php/lock` and `/rpc.php/boom` routes cover the three
+things a FastCGI application does with the call plane — store, coordinate, and report a refusal.
+
 ## Tests
 
 ```bash
@@ -428,6 +480,13 @@ php tests/run.php          # 410 assertions, no PHPUnit needed
   race — a peer that sends `CONTROL drain` and closes without reading the ack, which is what
   `Slot::stop()` does on every attached recycle. The fork half is skipped on Windows, where `pcntl`
   does not exist; the pure half (`relayPath()`, the argument checks, the refusal) runs everywhere.
+- `tests/RpcTest.php` drives `Rpc` over `stream_socket_pair()` for every answer-shaped case — a
+  served call, a refusal, an undecided one, a frame a caller should never see, a payload that is not
+  JSON, a declared length past what the client will allocate — and then starts a **real client
+  process** against a loopback listener for the two cases a pair cannot show: that the client
+  connects, and that a broken connection is not remembered. The socket pair is `STREAM_PF_INET`
+  rather than `STREAM_PF_UNIX`, because the latter does not exist on Windows and this file has to
+  run there too.
 
 Running the suite prints a `WARNING-MARKER` line on stderr. That is the mechanism working, not a
 failure: the warning went to stderr instead of into a frame.
