@@ -550,6 +550,42 @@ Assert::same(null, $plane->call('kv.cache.get'), 'a plane whose server is down r
 Assert::contains('could not be reached', (string) $plane->lastCallError(), 'and says so');
 Assert::same(false, $plane->lastCallWasUnknown(), 'nothing was sent, so the call did not happen');
 
+// ------------------------------------------------------------ the batch methods' keys
+
+// **A batch key is encoded exactly as a single key is**, and the server had this wrong: it read the
+// list as literal strings while decoding every scalar `key`, so the two spellings addressed different
+// entries and a batch read reported every key as missing. Nothing caught it, because no test on
+// either side of the wire ever sent one.
+//
+// This asserts on the *bytes the client writes*, because that is the half this repository owns. The
+// server's half is `a_batch_key_is_base64_in_both_directions` in `volucer-server`.
+[$client, $server] = rpc_pair();
+$batch = new Rpc($client, 'token', '127.0.0.1:1', 0.5);
+$kv = $batch->kv('cache');
+
+// Each call takes the next id from a descending counter, so the answer has to name the id the client
+// just wrote. Read from the frame rather than assumed, so this is not a test of the counter.
+rpc_write_return($server, 0xFFFFFFFF, ['ok' => true, 'result' => ['values' => []]]);
+$kv->getMultiple(['greeting']);
+$sent = json_decode(rpc_read_frame($server)['payload'], true, 512, JSON_THROW_ON_ERROR);
+Assert::same('kv.cache.getMultiple', $sent['name'], 'the batch method is a three-part kv call');
+Assert::same(
+    [base64_encode('greeting')],
+    $sent['params']['keys'],
+    'a batch key goes on the wire base64-encoded, like a single key',
+);
+
+// The write side, which is the one that could lose data: an unencoded key would be stored under a name
+// no `get` could ever produce.
+rpc_write_return($server, 0xFFFFFFFE, ['ok' => true, 'result' => ['stored' => 1]]);
+$kv->setMultiple(['farewell' => 'bye']);
+$sent = json_decode(rpc_read_frame($server)['payload'], true, 512, JSON_THROW_ON_ERROR);
+Assert::same(
+    [base64_encode('farewell') => base64_encode((string) json_encode('bye'))],
+    $sent['params']['values'],
+    'a batch write encodes the key and the value, and the value carries its own JSON encoding',
+);
+
 foreach (glob($dir . '/*') ?: [] as $entry) {
     @unlink($entry);
 }
