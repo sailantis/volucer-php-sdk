@@ -49,6 +49,15 @@ final class Header
      * one, and would let corruption of the checksum field itself disable the check.
      */
     public const FLAG_NO_CHECKSUM = 0x0010;
+    /**
+     * The `RESPONSE` head describes a body whose length is not declared.
+     *
+     * See {@see StreamedResponse}. A flag rather than "a zero `body_len` means unknown", because
+     * `body_len: 0` is already a correctly empty body — a `204`, a `HEAD` — and a reader that treated
+     * every zero as "stream me bytes" would consume the next request's frames as this response's body.
+     * The same reasoning {@see FLAG_NO_CHECKSUM} documents for its own sentinel.
+     */
+    public const FLAG_STREAMED = 0x0020;
 
     public function __construct(
         public readonly int $payloadLen,

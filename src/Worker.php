@@ -811,6 +811,13 @@ final class Worker implements CallPlane
                 }
                 $result = $handler($request, $this);
                 $captured = $this->endCapture();
+                // **A streamed response leaves here, and does not come back.** Its head goes out
+                // before its body exists, so it cannot be normalised into a `Response` and answered
+                // by `respond()` below — that method's whole contract is that the body is complete.
+                if ($result instanceof StreamedResponse) {
+                    $this->respondStreamed($result, 0, (int) ((hrtime(true) - $started) / 1000));
+                    return;
+                }
                 $response = $this->normalise($result, $captured);
             }
             $appStatus = 0;
@@ -982,6 +989,130 @@ final class Worker implements CallPlane
 
         if (!$this->keepAlive) {
             $this->stopping = true;
+        }
+    }
+
+    /**
+     * Write a streamed response: head, chunks as they are produced, then the terminal status.
+     *
+     * # The one rule this has to keep
+     *
+     * **Exactly one `BODY` frame carries `FLAG_LAST`, and it is the last one.** `LAST` is the only
+     * end signal a `STREAMED` head leaves — there is no declared length to check against — so a body
+     * that ends without it is reported by the server as a truncated response. That is why this
+     * cannot simply loop over the generator and write a trailing empty `LAST` frame afterwards on
+     * the happy path: an empty chunk never reaches the wire, so the flag has to be attached to the
+     * last *non-empty* chunk, which is only known once the iteration has finished.
+     *
+     * # Why the chunk is held back
+     *
+     * Holding one chunk means the first byte of the body is delayed by one iteration. That is the
+     * price of never writing a zero-length `BODY` frame, which some front-ends treat as a framing
+     * error, and of never writing `LAST` early, which would tell the server the body was complete
+     * while the generator was still running. A generator that yields exactly one chunk therefore
+     * sends it only after the generator returns — one iteration, not the whole body.
+     *
+     * # Why an exception mid-stream is not a `500`
+     *
+     * The head is already on the wire with a `200`. Reporting the failure as a status would mean two
+     * statuses for one response, so the body is left unterminated instead: the connection ends
+     * without `LAST`, and the client learns the response was truncated. The diagnostic still says
+     * what happened.
+     */
+    private function respondStreamed(StreamedResponse $response, int $appStatus, int $durationUs): void
+    {
+        // **The factory runs before the head goes out, and that ordering is the whole point.**
+        // Creating a generator does not run it, so a `StreamedResponse` built from a closure has
+        // still had nothing happen at this moment — which means something that fails here is a
+        // failure with no status on the wire, and it is answerable with a `500` by the `catch` in
+        // `serve`. Anything that fails later, inside the generator, is not.
+        $chunks = $response->stream();
+
+        $this->sendJson(MessageType::RESPONSE, $this->requestId, [
+            'status' => $response->status,
+            'headers' => $response->headers,
+            // **Declared as zero and flagged**, which is the protocol's way of saying "unknown"
+            // rather than "empty". The two spellings must never both be used for one head.
+            'body_len' => 0,
+        ], Header::FLAG_STREAMED);
+
+        $held = null;
+        $failed = false;
+        try {
+            foreach ($chunks as $chunk) {
+                $chunk = (string) $chunk;
+                if ($chunk === '') {
+                    continue;
+                }
+                if ($held !== null) {
+                    $this->sendBody($held, false);
+                }
+                $held = $chunk;
+            }
+        } catch (\Throwable $exception) {
+            $failed = true;
+            $this->diagnose(sprintf(
+                'streamed response aborted after %s: %s in %s:%d',
+                $held === null ? 'no chunks' : 'a chunk was sent',
+                $exception->getMessage(),
+                $exception->getFile(),
+                $exception->getLine(),
+            ));
+        }
+
+        if ($failed) {
+            // **The chunk that was produced before the failure is still sent** — without `LAST`.
+            // Those bytes are real output, and dropping them would make a failing stream lose data
+            // it had already generated. What must not happen is `LAST` or `END`: without them the
+            // server reads the body as truncated, which is exactly what it is.
+            if ($held !== null) {
+                $this->sendBody($held, false);
+            }
+            // **No `LAST`, no `END`.** The server reads a streamed body that stops without `LAST` as
+            // a truncation, which is exactly true — and it is the only honest signal available once
+            // a `200` is already on the wire.
+            $this->stopping = true;
+            return;
+        }
+
+        if ($held !== null) {
+            $this->sendBody($held, true);
+        } else {
+            // A generator that produced nothing. An empty `LAST` frame is the one case where a
+            // zero-length `BODY` is correct: it is the end signal and there is no chunk to carry it.
+            $this->send(new Frame(MessageType::BODY, $this->requestId, '', Header::FLAG_LAST));
+        }
+
+        $this->sendJson(MessageType::END, $this->requestId, [
+            'app_status' => $appStatus,
+            'peak_memory_bytes' => $this->peakMemoryBytes(),
+            'duration_us' => $durationUs,
+            'keep_alive' => $this->keepAlive,
+        ]);
+
+        if (!$this->keepAlive) {
+            $this->stopping = true;
+        }
+    }
+
+    /**
+     * Write one body chunk, split at the protocol's frame limit.
+     *
+     * Only the **last** piece of the **last** chunk carries `LAST`, which is why this takes the flag
+     * as an argument rather than inferring it: the caller is the only place that knows whether more
+     * is coming.
+     */
+    private function sendBody(string $chunk, bool $last): void
+    {
+        $pieces = str_split($chunk, self::MAX_BODY_CHUNK);
+        $count = count($pieces);
+        foreach ($pieces as $index => $piece) {
+            $this->send(new Frame(
+                MessageType::BODY,
+                $this->requestId,
+                $piece,
+                $last && $index === $count - 1 ? Header::FLAG_LAST : 0,
+            ));
         }
     }
 
@@ -1985,11 +2116,11 @@ final class Worker implements CallPlane
     /**
      * Serialize a payload as JSON and send it.
      */
-    private function sendJson(int $messageType, int $requestId, mixed $value): void
+    private function sendJson(int $messageType, int $requestId, mixed $value, int $flags = 0): void
     {
         $encoded = json_encode($value, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES);
 
-        $this->send(new Frame($messageType, $requestId, $encoded));
+        $this->send(new Frame($messageType, $requestId, $encoded, $flags));
     }
 
     /**

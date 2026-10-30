@@ -294,6 +294,46 @@ $response->withStatus(201)->withHeader('X-Trace', 'abc')->withBody('…');
 
 `withHeader()` **appends** rather than replaces, so `Set-Cookie` can be sent more than once.
 
+### `StreamedResponse`
+
+A `Response` declares its body's length, so the server has to hold the whole thing before the status
+line goes out. That is right for a page and wrong for a CSV export or an SSE feed. `StreamedResponse`
+declares no length, so the server answers the head first and forwards each chunk as it is produced —
+**the peak memory of the response stops being the size of the response.**
+
+```php
+use Volucer\StreamedResponse;
+
+// A generator, so nothing is produced until the server is ready to forward it.
+return StreamedResponse::text(static function (): \Generator {
+    foreach (rows() as $row) {
+        yield $row . "\n";
+    }
+});
+
+// SSE: the headers an intermediary needs in order not to buffer it.
+return StreamedResponse::events(static function (): \Generator {
+    while (true) {
+        yield 'data: ' . json_encode(tick()) . "\n\n";
+        sleep(1);
+    }
+});
+```
+
+- **`LAST` is set for you**, on the last non-empty chunk. It is the only end signal a streamed body
+  has, so it is the one thing the SDK cannot let a handler get wrong.
+- **A throw inside the generator is a truncated response, not a `500`.** The head is already on the
+  wire with its status, so there is no status left to change; the body simply stops without `LAST`
+  and the client is told the transfer did not finish. Whatever was yielded before the failure is
+  still sent.
+- **The closure runs before the head is sent**, so a factory that fails *immediately* is still a
+  `500` — only a failure part way through the body is unreportable.
+- **No `Content-Length`, and no compression.** Both need the whole body. A download that is a file
+  is better served with `X-Sendfile`, whose response does carry a length and does support ranges.
+- The server relays it only when the deployment allows streaming (`stream_threshold_bytes > 0`) and
+  the status is 2xx. Otherwise the chunks are collected and sent whole, exactly as before, and the
+  handler does not have to know which happened.
+
 ### `Worker`
 
 | Method | Purpose |

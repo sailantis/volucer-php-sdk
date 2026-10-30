@@ -25,6 +25,7 @@ require __DIR__ . '/../autoload.php';
 
 use Volucer\Request;
 use Volucer\Response;
+use Volucer\StreamedResponse;
 use Volucer\Worker;
 
 // `connect()` is `create()` plus one decision: when the server has asked for the socket
@@ -62,7 +63,7 @@ $worker->onGrpc(static function (Request $request, Worker $worker): \Volucer\Grp
     );
 });
 
-$worker->run(static function (Request $request, Worker $worker): Response|null {
+$worker->run(static function (Request $request, Worker $worker): Response|StreamedResponse|null {
     $path = (string) parse_url($request->uri, PHP_URL_PATH);
 
     // Health: return a Response explicitly.
@@ -123,6 +124,29 @@ $worker->run(static function (Request $request, Worker $worker): Response|null {
     // thing arrives: chunking is where a length/flag disagreement would show up.
     if ($path === '/big') {
         return Response::text(str_repeat('abcdefgh', 100000));
+    }
+
+    // A response whose length is deliberately unknown, produced in pieces. This is the route that
+    // exercises `StreamedResponse`: the head goes out before the body exists, each piece is a
+    // `BODY` frame of its own, and `LAST` is attached to the final one. The pieces are deliberately
+    // small and counted rather than one large body, because the point is that they *arrive* as the
+    // generator yields rather than at the end.
+    if ($path === '/stream') {
+        return StreamedResponse::text(static function (): \Generator {
+            for ($row = 1; $row <= 4; $row++) {
+                yield "row-{$row}\n";
+            }
+        });
+    }
+
+    // A stream that fails after its head is already on the wire. There is no status left to
+    // report with, so the SDK withholds `LAST` and the server reports a truncated response —
+    // which is the honest answer and the one `a_truncated_stream` asserts.
+    if ($path === '/stream-boom') {
+        return StreamedResponse::text(static function (): \Generator {
+            yield "first\n";
+            throw new RuntimeException('the generator failed part way through');
+        });
     }
 
     return Response::html(

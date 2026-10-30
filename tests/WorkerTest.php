@@ -25,6 +25,7 @@ use Volucer\Header;
 use Volucer\MessageType;
 use Volucer\Request;
 use Volucer\Response;
+use Volucer\StreamedResponse;
 use Volucer\Worker;
 
 /**
@@ -491,6 +492,93 @@ Assert::same(
     strlen($big),
     json_of($chunked['frames'], MessageType::RESPONSE)[0]['body_len'],
     'body_len matches the chunked body',
+);
+
+// --------------------------------------------------------- streamed responses
+
+// A streamed response declares no length and flags the head instead, which is what
+// lets the server choose a framing before the body exists. This is the shape an
+// export or an SSE feed uses.
+$streamed = run_worker(
+    array_merge([A_HELLO], a_get('/export')),
+    static fn () => new StreamedResponse(
+        static function (): \Generator {
+            yield 'row1' . "\n";
+            yield 'row2' . "\n";
+        },
+        headers: [['Content-Type', 'text/plain']],
+    ),
+);
+
+$streamedHead = $streamed['frames'][1];
+Assert::same(MessageType::RESPONSE, $streamedHead['header']->messageType, 'the streamed head is a RESPONSE');
+Assert::same(
+    Header::FLAG_STREAMED,
+    $streamedHead['header']->flags & Header::FLAG_STREAMED,
+    'a streamed head carries FLAG_STREAMED',
+);
+Assert::same(
+    0,
+    json_decode($streamedHead['payload'], true, 512, JSON_THROW_ON_ERROR)['body_len'],
+    'a streamed head declares no length',
+);
+Assert::same(
+    ["row1\n", "row2\n"],
+    payloads_of($streamed['frames'], MessageType::BODY),
+    'every chunk reaches the wire in order',
+);
+$streamedBodies = array_values(array_filter(
+    $streamed['frames'],
+    static fn ($f) => $f['header']->messageType === MessageType::BODY,
+));
+Assert::true(
+    $streamedBodies[count($streamedBodies) - 1]['header']->isLast(),
+    'the last chunk carries LAST, which is the only end signal a streamed body has',
+);
+Assert::true(
+    !$streamedBodies[0]['header']->isLast(),
+    'and no earlier chunk does, or the server would stop reading mid-body',
+);
+
+// A generator that yields nothing still has to end the body, or the server reads a
+// streamed head with no LAST as a truncated response.
+$emptyStream = run_worker(
+    array_merge([A_HELLO], a_get('/empty')),
+    static fn () => new StreamedResponse((static function (): \Generator {
+        return;
+        yield;
+    })()),
+);
+$emptyBodies = array_values(array_filter(
+    $emptyStream['frames'],
+    static fn ($f) => $f['header']->messageType === MessageType::BODY,
+));
+Assert::same(1, count($emptyBodies), 'an empty stream still sends exactly one BODY frame');
+Assert::same('', $emptyBodies[0]['payload'], 'which is empty');
+Assert::true($emptyBodies[0]['header']->isLast(), 'and is the LAST, so the body is complete');
+
+// An exception part way through cannot become a 500: the head is already on the wire
+// with a 200, so the honest signal is a body that never ends.
+$aborted = run_worker(
+    array_merge([A_HELLO], a_get('/boom')),
+    static fn () => new StreamedResponse((static function (): \Generator {
+        yield 'first';
+        throw new \RuntimeException('BOOM-MARKER');
+    })()),
+);
+$abortedBodies = array_values(array_filter(
+    $aborted['frames'],
+    static fn ($f) => $f['header']->messageType === MessageType::BODY,
+));
+Assert::same(
+    0,
+    count(array_filter($abortedBodies, static fn ($f) => $f['header']->isLast())),
+    'an aborted stream must not flag LAST, which would present a truncated body as complete',
+);
+Assert::same([], payloads_of($aborted['frames'], MessageType::END), 'and sends no END frame');
+Assert::true(
+    str_contains($aborted['stderr'], 'BOOM-MARKER'),
+    'the reason still reaches the log: ' . $aborted['stderr'],
 );
 
 // ----------------------------------------------------------- request bodies
