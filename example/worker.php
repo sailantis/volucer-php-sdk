@@ -134,6 +134,12 @@ $worker->run(static function (Request $request, Worker $worker): Response|Stream
             'post' => $request->post(),
             'files' => $files,
             'globals_agree' => $_POST === $request->post() && $_FILES === $request->files(),
+            // **The raw body, and how long it was.** A streamed body has no declared length on
+            // the wire, so the only way to see that every frame arrived in order is to read what
+            // the application actually got. `body` is what `tests/worker_pool.rs` compares against
+            // the frames it fed in.
+            'received' => strlen($request->body),
+            'body' => $request->body,
         ]);
     }
 

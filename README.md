@@ -291,6 +291,20 @@ Worker::create()->run(function (Request $request, Worker $worker): ?Response {
 `BODY` frames arrive and writes each file part straight to its temp file, so **peak memory is the
 size of the largest text field, not the size of the upload**.
 
+#### A large upload does not have to be held by the server either
+
+The SDK advertises `stream_request_body` in its `HELLO_ACK`, which tells the server it can read a
+body whose length was not declared. A server that sees it forwards the frames as the client produces
+them instead of buffering the whole body first: `$request->body` is built from the frames exactly as
+before, so nothing an application does changes — what changes is that a 256 MiB upload costs the
+server a few hundred kilobytes rather than 256 MiB. An SDK that does not advertise keeps receiving
+`body_len` and the old buffered behaviour, which is why the field exists rather than the server
+deciding for itself.
+
+Because the frames arrive rather than being handed over whole, the parser's streaming spooling and
+the server's streaming are the two halves of the same idea, and they compose: neither the server nor
+the application has to hold the upload.
+
 #### The one thing a worker cannot do
 
 `is_uploaded_file()` and `move_uploaded_file()` consult a hash the **PHP SAPI** fills while it parses

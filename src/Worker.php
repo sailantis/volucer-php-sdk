@@ -697,7 +697,7 @@ final class Worker implements CallPlane
         $this->keepAlive = true;
 
         $metadata = $this->decodeJson($payload, 'a JOB header');
-        $body = $this->readRequestBody($header->requestId, $this->intField($metadata, 'body_len'));
+        $body = $this->readRequestBody($header->requestId, $this->optionalIntField($metadata, 'body_len'));
 
         $job = new Job(
             pipeline: $this->stringField($metadata, 'pipeline'),
@@ -779,7 +779,7 @@ final class Worker implements CallPlane
     private function refuseJob(Header $header, string $payload): void
     {
         $metadata = $this->decodeJson($payload, 'a JOB header');
-        $this->readRequestBody($header->requestId, $this->intField($metadata, 'body_len'));
+        $this->readRequestBody($header->requestId, $this->optionalIntField($metadata, 'body_len'));
 
         $this->sendJson(MessageType::ACK, $header->requestId, [
             'outcome' => 'reject',
@@ -818,10 +818,10 @@ final class Worker implements CallPlane
         $multipart = null;
         if (Multipart::isMultipart($contentType)) {
             $multipart = new Multipart($contentType);
-            $body = $this->readRequestBody($header->requestId, $this->intField($metadata, 'body_len'), $multipart);
+            $body = $this->readRequestBody($header->requestId, $this->optionalIntField($metadata, 'body_len'), $multipart);
             $multipart->finish();
         } else {
-            $body = $this->readRequestBody($header->requestId, $this->intField($metadata, 'body_len'));
+            $body = $this->readRequestBody($header->requestId, $this->optionalIntField($metadata, 'body_len'));
         }
 
         $started = hrtime(true);
@@ -1641,6 +1641,13 @@ final class Worker implements CallPlane
             'pid' => (int) getmypid(),
             'runtime' => self::runtime(),
             'no_checksum' => $offer,
+            // **This SDK can read a body whose length it was not told.** The server only sends
+            // `REQUEST` without `body_len` to a worker that says so here, because the alternative
+            // is worse than a missing feature: an SDK that predates the field reads an absent
+            // `body_len` as `0`, concludes there is nothing to read, and then takes the first
+            // `BODY` frame for its own response. One absent key would desynchronise every request,
+            // which is why the party that has to cope is the one that advertises.
+            'stream_request_body' => true,
         ]);
 
         if ($offer) {
@@ -1764,21 +1771,25 @@ final class Worker implements CallPlane
      * still built, because `$request->body` has always carried the raw bytes and an application
      * that parses multipart itself would otherwise lose them.
      */
-    private function readRequestBody(int $requestId, int $bodyLen, ?Multipart $sink = null): string
+    private function readRequestBody(int $requestId, ?int $bodyLen, ?Multipart $sink = null): string
     {
+        // `null` means the server did not declare a length: the body is streamed and `LAST` is the
+        // only end signal. An explicit `0` is a genuinely empty body and short-circuits here.
         if ($bodyLen === 0) {
             return '';
         }
 
         $body = '';
-        while (strlen($body) < $bodyLen) {
+        while ($bodyLen === null || strlen($body) < $bodyLen) {
             $header = $this->readHeader();
             if ($header === null) {
-                throw new ProtocolException(sprintf(
-                    'the server closed the pipe after %d of %d body bytes',
-                    strlen($body),
-                    $bodyLen,
-                ));
+                throw new ProtocolException($bodyLen === null
+                    ? 'the server closed the pipe in the middle of a streamed request body'
+                    : sprintf(
+                        'the server closed the pipe after %d of %d body bytes',
+                        strlen($body),
+                        $bodyLen,
+                    ));
             }
 
             $payload = $this->readPayload($header);
@@ -1799,6 +1810,16 @@ final class Worker implements CallPlane
 
             $sink?->feed($payload);
             $body .= $payload;
+
+            if ($bodyLen === null) {
+                // **`LAST` is the terminator, and this is the only place a streamed body ends.**
+                // It is checked *after* the payload has been fed to the sink, so a final frame that
+                // also carried the last bytes of a file is not dropped.
+                if ($header->isLast()) {
+                    break;
+                }
+                continue;
+            }
 
             if ($header->isLast() && strlen($body) !== $bodyLen) {
                 throw new ProtocolException(sprintf(
@@ -2229,6 +2250,26 @@ final class Worker implements CallPlane
         $value = $data[$key] ?? $default;
 
         return is_numeric($value) ? (int) $value : $default;
+    }
+
+    /**
+     * A field that is genuinely absent when it is not there.
+     *
+     * `null` and `0` mean different things on the wire and must keep doing so: a `body_len` of `0`
+     * is a correctly empty body, while an absent one means "the length is unknown, the body ends at
+     * `LAST`". Folding the two together with a `0` default is how a streamed request would be read
+     * as an empty one.
+     *
+     * @param array<string, mixed> $data
+     */
+    private function optionalIntField(array $data, string $key): ?int
+    {
+        if (!array_key_exists($key, $data)) {
+            return null;
+        }
+        $value = $data[$key];
+
+        return is_numeric($value) ? (int) $value : null;
     }
 
     /**

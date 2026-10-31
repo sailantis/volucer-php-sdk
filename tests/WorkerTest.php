@@ -2396,4 +2396,117 @@ if ($listener === false) {
     fclose($listener);
 }
 
+// ------------------------------------------------------------ streamed request bodies
+
+// **The capability is advertised.** The server only sends a `REQUEST` with no `body_len` to a
+// worker that says it can cope, because an SDK that predates the field reads an absent length as
+// `0` and would take the first `BODY` frame for its own response.
+$advertised = run_worker(array_merge([A_OFFERED_HELLO], a_get('/cap')), static fn () => Response::text('ok'));
+Assert::same(
+    true,
+    json_of($advertised['frames'], MessageType::HELLO_ACK)[0]['stream_request_body'],
+    'the SDK tells the server it can read a body of unknown length',
+);
+
+// A body with no declared length ends at `LAST`, and `$request->body` carries the bytes.
+$streamed = run_worker(
+    [
+        [MessageType::HELLO, 0, ['protocol_version' => 1]],
+        [MessageType::REQUEST, 1, [
+            'method' => 'POST',
+            'uri' => '/upload',
+            'protocol' => 'HTTP/1.1',
+            'headers' => [['Content-Type', 'application/octet-stream']],
+            'remote_addr' => '127.0.0.1',
+            'script_filename' => 'index.php',
+            // No `body_len`: the length is unknown and `LAST` is the only end signal.
+            'https' => false,
+        ]],
+        [MessageType::BODY, 1, 'abc'],
+        [MessageType::BODY, 1, 'defg'],
+        [MessageType::BODY, 1, '', Header::FLAG_LAST],
+    ],
+    static fn (Request $request) => Response::text($request->body),
+);
+Assert::same(
+    ['abcdefg'],
+    payloads_of($streamed['frames'], MessageType::BODY),
+    'every streamed frame of the body reaches the application, in order',
+);
+// The handler echoes `$request->body`, so the response body *is* the concatenation. A reader that
+// stopped after the first frame would answer `abc`, which is why this is checked separately from
+// the frame count above.
+Assert::true(
+    str_contains(payloads_of($streamed['frames'], MessageType::BODY)[0], 'abcdefg'),
+    'the body is the whole stream, not just its first frame',
+);
+
+// `LAST` alone ends it even when it arrives in the same frame as content.
+$single = run_worker(
+    [
+        [MessageType::HELLO, 0, ['protocol_version' => 1]],
+        [MessageType::REQUEST, 1, [
+            'method' => 'POST',
+            'uri' => '/one',
+            'headers' => [],
+            'remote_addr' => '127.0.0.1',
+            'script_filename' => 'index.php',
+            'https' => false,
+        ]],
+        [MessageType::BODY, 1, 'entire', Header::FLAG_LAST],
+    ],
+    static fn (Request $request) => Response::text($request->body),
+);
+Assert::same(
+    ['entire'],
+    payloads_of($single['frames'], MessageType::BODY),
+    'a single frame carrying LAST ends a streamed body',
+);
+
+// A streamed body with no frames at all is an empty body, not a hang: the terminator is an empty
+// `LAST` frame and the loop must accept it as the end.
+$empty = run_worker(
+    [
+        [MessageType::HELLO, 0, ['protocol_version' => 1]],
+        [MessageType::REQUEST, 1, [
+            'method' => 'POST',
+            'uri' => '/empty',
+            'headers' => [],
+            'remote_addr' => '127.0.0.1',
+            'script_filename' => 'index.php',
+            'https' => false,
+        ]],
+        [MessageType::BODY, 1, '', Header::FLAG_LAST],
+    ],
+    static fn (Request $request) => Response::text('len=' . strlen($request->body)),
+);
+Assert::same(
+    ['len=0'],
+    payloads_of($empty['frames'], MessageType::BODY),
+    'an empty streamed body is empty, not a deadlock',
+);
+
+// **A declared length is still authoritative.** Streaming did not change that: a body that ends
+// early is a protocol error rather than a short body silently accepted.
+Assert::throws(
+    static function (): void {
+        $in = server_stream([
+            [MessageType::HELLO, 0, ['protocol_version' => 1]],
+            [MessageType::REQUEST, 1, [
+                'method' => 'POST',
+                'uri' => '/short',
+                'headers' => [],
+                'remote_addr' => '127.0.0.1',
+                'script_filename' => 'index.php',
+                'body_len' => 10,
+                'https' => false,
+            ]],
+            [MessageType::BODY, 1, 'abc', Header::FLAG_LAST],
+        ]);
+        (new Worker($in, sink(), sink()))->run(static fn () => Response::text('x'));
+    },
+    'a declared length that is not met is still refused',
+    'declared bytes',
+);
+
 exit(Assert::report('worker behaviour'));
