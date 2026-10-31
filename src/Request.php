@@ -29,6 +29,8 @@ final class Request
         public readonly bool $https,
         public readonly string $body,
         public readonly array $server = [],
+        public readonly array $post = [],
+        public readonly array $files = [],
     ) {
     }
 
@@ -49,6 +51,36 @@ final class Request
     public function contentType(): ?string
     {
         return $this->header('content-type');
+    }
+
+    /**
+     * The parsed form fields, as a SAPI would put in `$_POST`.
+     *
+     * Populated only for the two media types a SAPI parses:
+     * `application/x-www-form-urlencoded` and `multipart/form-data`. Empty for anything else,
+     * which is the same answer a `php-cgi` deployment gives — an application that wants JSON
+     * reads {@see Request::$body}.
+     *
+     * @return array<string, mixed>
+     */
+    public function post(): array
+    {
+        return $this->post;
+    }
+
+    /**
+     * The uploaded files, as a SAPI would put in `$_FILES` — including its transposed shape.
+     *
+     * Read this rather than re-parsing {@see Request::$body}: the parser already streamed each
+     * file to disk, so the bodies are not held in memory. `$request->body` still carries the raw
+     * multipart bytes, because PHP's own `php://input` being empty for multipart is a quirk
+     * worth being a superset of rather than copying.
+     *
+     * @return array<string, mixed>
+     */
+    public function files(): array
+    {
+        return $this->files;
     }
 
     /**

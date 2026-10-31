@@ -278,8 +278,70 @@ Worker::create()->run(function (Request $request, Worker $worker): ?Response {
 | `contentType()` | shorthand for the `Content-Type` header |
 | `query()` | the query string parsed the way PHP populates `$_GET` |
 | `cookies()` | the `Cookie` header parsed the way PHP populates `$_COOKIE` |
+| `post()` | the form fields, the way PHP populates `$_POST` |
+| `files()` | the uploads, the way PHP populates `$_FILES` |
 | `serverVars()` | CGI-style variables derived from the request (for legacy code) |
 | `remoteAddr`, `scriptFilename`, `https` | as sent |
+
+### Uploads and forms
+
+`application/x-www-form-urlencoded` and `multipart/form-data` are both parsed, so
+`$request->post()` and `$request->files()` — and `$_POST` and `$_FILES` — are populated exactly as a
+`php-cgi` deployment would populate them. The parser is incremental: it consumes the body as the
+`BODY` frames arrive and writes each file part straight to its temp file, so **peak memory is the
+size of the largest text field, not the size of the upload**.
+
+#### The one thing a worker cannot do
+
+`is_uploaded_file()` and `move_uploaded_file()` consult a hash the **PHP SAPI** fills while it parses
+multipart. A worker is not a SAPI, so both return `false` for a file the worker wrote — there is no
+API to add to that hash. This is a PHP engine boundary, not a gap in volucer; RoadRunner has the
+same one.
+
+Everything downstream of the temp file works, because it operates on a path. What differs is only
+these two functions:
+
+| | `php-cgi` / `php-fpm` | worker |
+| --- | --- | --- |
+| `$_POST` / `$_FILES` populated | yes | yes |
+| `is_uploaded_file()`, `move_uploaded_file()` | yes | **no** |
+| `rename()`, `copy()`, `fopen()` | yes | yes |
+| Laravel `$file->store()`, `get()` | yes | yes |
+| Symfony `$file->move()`, `isValid()` | yes | yes, *through the bridge's flag — see below* |
+| PSR-7 / Spiral `moveTo()` | yes | yes (`Nyholm` uses `rename()` under `PHP_SAPI=cli`) |
+
+So there is one call to use instead of `move_uploaded_file()`:
+
+```php
+use Volucer\Uploads;
+
+// in either mode
+Uploads::move($_FILES['doc'], '/srv/storage/doc.pdf');
+```
+
+`Uploads::move()` tries `move_uploaded_file()` first — so in CGI mode nothing changes, including
+PHP's own bookkeeping — and falls back to `rename()`. `Uploads::isOk()`, `movedFromClient()`,
+`errorMessage()` and `discard()` are there for the rest of the difference.
+
+**The framework bridges need one flag, and it is not the application's business.** Symfony's
+`UploadedFile::isValid()` calls `is_uploaded_file()` unless the object was built with `test = true`.
+The Laravel and Symfony bridges build the files that way, so `isValid()` and `move()` work. Laravel
+additionally needs `Illuminate\Http\UploadedFile`, not the Symfony base class, because
+`createFromBase()` rebuilds the latter with the flag cleared. Spiral needs nothing, because Nyholm
+already branches on `PHP_SAPI`.
+
+#### What is deliberately a superset of PHP
+
+PHP consumes the body while parsing it, so `php://input` is **empty** for a multipart request under a
+SAPI. A worker keeps the raw bytes as well: `$request->body` is still the multipart body, *and*
+`$_FILES` is populated. Applications that read `php://input`, or that parse multipart themselves,
+therefore keep working.
+
+#### Not populated
+
+`$_REQUEST` is left empty rather than guessed, because its contents depend on `request_order`, which
+the SDK cannot know. `$_ENV` likewise. `$_SESSION` is started by `session_start()` as usual, which
+reads `$_COOKIE` and works normally.
 
 ### `Response`
 

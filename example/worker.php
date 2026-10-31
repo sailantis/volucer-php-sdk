@@ -104,6 +104,39 @@ $worker->run(static function (Request $request, Worker $worker): Response|Stream
         return null;
     }
 
+    // What a form post looks like to a worker, read through both routes: the `Request`
+    // accessors and the superglobals. They must agree — the superglobals are filled from the
+    // same arrays — and a test that compares them catches a bridge that filled one and not the
+    // other.
+    //
+    // The upload is reported by name and size rather than by contents: the point is that the
+    // file exists, is where `$_FILES` says it is, and holds the client's bytes, and printing the
+    // bytes would make this route useless for anything larger than a page.
+    if ($path === '/upload') {
+        $files = [];
+        foreach ($request->files() as $field => $entry) {
+            if (!is_array($entry) || !isset($entry['tmp_name'])) {
+                continue;
+            }
+            $tmp = (string) $entry['tmp_name'];
+            $files[$field] = [
+                'name' => $entry['name'] ?? null,
+                'size' => $entry['size'] ?? null,
+                'error' => $entry['error'] ?? null,
+                // Read here, while the request is still open: the worker removes its own temp
+                // files once the response is written.
+                'contents' => is_file($tmp) ? file_get_contents($tmp) : null,
+                'is_uploaded_file' => is_uploaded_file($tmp),
+            ];
+        }
+
+        return Response::json([
+            'post' => $request->post(),
+            'files' => $files,
+            'globals_agree' => $_POST === $request->post() && $_FILES === $request->files(),
+        ]);
+    }
+
     // Ask the server to replace this worker once the request is done. The SDK
     // reports `keep_alive = false` in END and the pool boots a fresh process,
     // which is what an application does when it has put itself into a state it

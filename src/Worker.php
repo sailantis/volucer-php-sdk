@@ -175,6 +175,23 @@ final class Worker implements CallPlane
 
     private int $requestId = self::UNSOLICITED;
 
+    /**
+     * The parsed form fields for the request being served, and its uploaded files.
+     *
+     * Held on the worker rather than threaded through `buildRequest` as more parameters,
+     * because the two are per-request state set once and read from three places — the
+     * superglobals, `buildRequest`, and the `finally` that clears them.
+     *
+     * @var array<string, mixed>
+     */
+    private array $currentPost = [];
+
+    /** @var array<string, mixed> */
+    private array $currentFiles = [];
+
+    /** Whether this request had its CGI superglobals installed, and so must clear them. */
+    private bool $installingGlobals = false;
+
     /** The output-buffer nesting depth we found when the capture started. */
     private int $captureLevel = 0;
 
@@ -787,7 +804,25 @@ final class Worker implements CallPlane
         $this->keepAlive = true;
 
         $metadata = $this->decodeJson($payload, 'a REQUEST header');
-        $body = $this->readRequestBody($header->requestId, $this->intField($metadata, 'body_len'));
+
+        // **A multipart body is parsed while it is being read, not after.** That is the whole
+        // difference between a worker that can accept a 1 GiB upload and one that cannot: the
+        // parser writes each file part to disk as its bytes arrive, so peak memory is the size
+        // of the largest text field rather than the size of the body.
+        //
+        // The body is *also* kept as a string, which is why this is not purely incremental: an
+        // application that reads `$request->body` — or parses multipart itself — has always seen
+        // the raw bytes, and PHP's own `php://input` being empty for multipart is a behaviour
+        // worth being a superset of rather than copying. See `Multipart`'s class comment.
+        $contentType = $this->headerValue($metadata, 'content-type') ?? '';
+        $multipart = null;
+        if (Multipart::isMultipart($contentType)) {
+            $multipart = new Multipart($contentType);
+            $body = $this->readRequestBody($header->requestId, $this->intField($metadata, 'body_len'), $multipart);
+            $multipart->finish();
+        } else {
+            $body = $this->readRequestBody($header->requestId, $this->intField($metadata, 'body_len'));
+        }
 
         $started = hrtime(true);
         // Capture is started before either arm and is *discarded* by the gRPC one: `echo` cannot become a
@@ -795,6 +830,20 @@ final class Worker implements CallPlane
         // here rather than inside the HTTP arm means the `$request` both arms see is built in the same
         // protected scope, with one place that opens it.
         $this->beginCapture();
+
+        // **Installed before the handler and cleared in a `finally`.** A worker process serves
+        // many requests, so a superglobal left populated is the next request's user seeing this
+        // one's upload — the highest-severity failure this path can have. The reset covers every
+        // exit: a normal return, a throw, and the streamed-response early return below.
+        //
+        // Only for an HTTP request. A gRPC call is not a form submission, and filling `$_POST`
+        // from its length-delimited body would be inventing data.
+        $this->currentPost = $multipart?->post() ?? [];
+        $this->currentFiles = $multipart?->files() ?? [];
+        $this->installingGlobals = $multipart !== null && !$this->looksLikeGrpc($metadata);
+        if ($this->installingGlobals) {
+            Globals::install($this->buildRequest($metadata, $body), $this->currentPost, $this->currentFiles);
+        }
 
         try {
             $request = $this->buildRequest($metadata, $body);
@@ -849,6 +898,18 @@ final class Worker implements CallPlane
                 )
                 : Response::text("Internal Server Error\n", 500);
             $appStatus = 1;
+        } finally {
+            // Runs on every path, including the streamed early return, and after the handler's
+            // response has been written. Order matters: the globals are cleared *before* the
+            // temp files are removed, so a handler that stored a `tmp_name` in a database and
+            // reads it on the next request gets a missing file rather than another user's.
+            if ($this->installingGlobals) {
+                Globals::reset();
+                $this->installingGlobals = false;
+            }
+            $this->currentPost = [];
+            $this->currentFiles = [];
+            $multipart?->cleanup();
         }
 
         $durationUs = (int) ((hrtime(true) - $started) / 1000);
@@ -1696,8 +1757,14 @@ final class Worker implements CallPlane
      * A frame flagged LAST that arrives early means the sender and this reader
      * disagree about the length, which is worth failing on rather than papering
      * over: the rest of the stream cannot be trusted after that.
+     *
+     * **`$sink` is fed each frame as it arrives**, before the frame is appended. A multipart
+     * parser passed here therefore sees the body incrementally and can spool a file part to
+     * disk immediately, which is what keeps peak memory off the upload's size. The string is
+     * still built, because `$request->body` has always carried the raw bytes and an application
+     * that parses multipart itself would otherwise lose them.
      */
-    private function readRequestBody(int $requestId, int $bodyLen): string
+    private function readRequestBody(int $requestId, int $bodyLen, ?Multipart $sink = null): string
     {
         if ($bodyLen === 0) {
             return '';
@@ -1730,6 +1797,7 @@ final class Worker implements CallPlane
                 ));
             }
 
+            $sink?->feed($payload);
             $body .= $payload;
 
             if ($header->isLast() && strlen($body) !== $bodyLen) {
@@ -1770,6 +1838,8 @@ final class Worker implements CallPlane
             scriptFilename: $this->stringField($metadata, 'script_filename'),
             https: (bool) ($metadata['https'] ?? false),
             body: $body,
+            post: $this->currentPost,
+            files: $this->currentFiles,
         );
     }
 
@@ -2169,6 +2239,36 @@ final class Worker implements CallPlane
         $value = $data[$key] ?? $default;
 
         return is_string($value) ? $value : $default;
+    }
+
+    /**
+     * One request header out of the REQUEST metadata, looked up case-insensitively.
+     *
+     * The metadata carries `headers` as a list of `[name, value]` pairs rather than a map,
+     * because HTTP header names are case-insensitive and their original spelling is worth
+     * keeping; a map would have to pick one key and silently drop a duplicate spelled
+     * differently. Building a `Request` merely to read one header would be the wrong shape for
+     * a decision `serve()` has to take *before* the request exists.
+     *
+     * @param array<string, mixed> $data
+     */
+    private function headerValue(array $data, string $name): ?string
+    {
+        $pairs = $data['headers'] ?? null;
+        if (!is_array($pairs)) {
+            return null;
+        }
+
+        foreach ($pairs as $pair) {
+            if (!is_array($pair) || count($pair) !== 2) {
+                continue;
+            }
+            if (strcasecmp((string) $pair[0], $name) === 0) {
+                return (string) $pair[1];
+            }
+        }
+
+        return null;
     }
 
     /**
