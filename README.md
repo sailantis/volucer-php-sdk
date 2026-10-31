@@ -312,6 +312,21 @@ multipart. A worker is not a SAPI, so both return `false` for a file the worker 
 API to add to that hash. This is a PHP engine boundary, not a gap in volucer; RoadRunner has the
 same one.
 
+**FFI does not solve it**, and it was measured rather than assumed. The engine does export
+`sapi_globals_id`, `sapi_globals_offset` and `zend_hash_str_add`, so the hash is reachable in
+principle — but `rfc1867_uploaded_files` is a *field* inside `sapi_globals_struct` whose offset is a
+compile-time constant of one specific build, and no header ships with a binary PHP distribution to
+read it from. Writing a probe `zend_array` at the one plausible offset returned `false` from
+`is_uploaded_file()` and then killed the process with a heap-corruption exit; a structural scan for
+the real offset died with an access violation. On top of that, `ffi.enable` defaults to `preload` and
+is `PHP_INI_SYSTEM`, so `ini_set` cannot turn it on from inside an application. An offset that must
+be hard-coded per PHP version, architecture and ZTS setting, and that corrupts memory when it is
+wrong on the next patch release, is not a foundation to build a security-relevant answer on.
+
+A C extension could do it — that is how FrankenPHP gets real `$_FILES` — but that is a shipping
+surface per PHP ABI, built to change two function return values. `Volucer\Uploads::move()` costs one
+call and works today.
+
 Everything downstream of the temp file works, because it operates on a path. What differs is only
 these two functions:
 
