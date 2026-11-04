@@ -2154,6 +2154,19 @@ final class Worker implements CallPlane
      * partial reads itself. Hand-rolling an `fread` loop is the bug-prone part
      * of every pipe protocol, and this call is why the SDK does not have one.
      *
+     * **Except that it does not block until it has 16 bytes.** It returns as soon as *anything*
+     * is available, and it returns `''` for a read that hit the stream's deadline. Measured:
+     *
+     *     peer sends 8 of 16 bytes, then stalls past the deadline
+     *         -> returns 'HHHHHHHH' (8 bytes), timed_out=true, feof=false
+     *
+     * So a header can arrive in pieces, and the loop below reassembles it. The previous version
+     * handed whatever it got straight to `Header::decode`, which throws on anything that is not
+     * exactly 16 bytes — so a **slow** server killed the worker with "a frame header is exactly
+     * 16 bytes, got 8". That is the same defect as the idle one below, reached through the loud
+     * door instead of the quiet one: a deadline is not a close, whether it lands between frames
+     * or in the middle of one.
+     *
      * **A timed-out read is not a closed connection, and this method used to conflate them.**
      * PHP applies `default_socket_timeout` to reads on a socket stream — 60 seconds unless the
      * deployment says otherwise — and `stream_get_contents()` returns `''` for a read that timed
@@ -2169,10 +2182,10 @@ final class Worker implements CallPlane
      *     deadline hit, peer still open:  read=''  timed_out=true   feof=false
      *     peer closed while waiting:      read=''  timed_out=false  feof=true
      *
-     * So the loop below waits out a quiet connection and returns `null` only for a real close.
-     * `stream_get_meta_data()` is consulted as well, because `feof` is documented as "the last
-     * read hit EOF" rather than as a general predicate, and two independent readings of the same
-     * fact is the right number here.
+     * So the loop below waits out a quiet connection and returns `null` only for a real close
+     * *between* frames. `stream_get_meta_data()` is consulted as well, because `feof` is
+     * documented as "the last read hit EOF" rather than as a general predicate, and two
+     * independent readings of the same fact is the right number here.
      *
      * The alternative — a deployment setting `default_socket_timeout = -1` — also works. It cannot
      * be relied on, though: a `-d` flag on the supervisor is invisible to the worker that inherits
@@ -2183,20 +2196,36 @@ final class Worker implements CallPlane
      */
     private function readHeader(): ?Header
     {
-        while (true) {
-            $bytes = stream_get_contents($this->in, Header::HEADER_LEN);
+        $buffer = '';
 
-            if ($bytes === false || $bytes === '') {
+        while (strlen($buffer) < Header::HEADER_LEN) {
+            $piece = stream_get_contents($this->in, Header::HEADER_LEN - strlen($buffer));
+
+            if ($piece === false || $piece === '') {
                 if ($this->readTimedOut()) {
                     // Nothing arrived and nobody left: the server is idle, not finished.
                     continue;
                 }
 
-                return null;
+                if ($buffer === '') {
+                    // A clean end *between* frames: the server is finished with this worker.
+                    return null;
+                }
+
+                // A clean end *inside* a frame: the stream really did stop mid-header, and that
+                // is a protocol failure rather than a shutdown. Reported as such instead of being
+                // handed to `Header::decode`, which would describe it as a malformed frame.
+                throw new ProtocolException(sprintf(
+                    'a frame header is %d bytes but the stream ended after %d',
+                    Header::HEADER_LEN,
+                    strlen($buffer),
+                ));
             }
 
-            return Header::decode($bytes);
+            $buffer .= $piece;
         }
+
+        return Header::decode($buffer);
     }
 
     /**
