@@ -2408,6 +2408,40 @@ Assert::same(
     'the SDK tells the server it can read a body of unknown length',
 );
 
+// ------------------------------------------------------------ the keepalive capability
+
+// **`answers_ping` is advertised, and that is not cosmetic.** The server pings only a worker that
+// says it can answer, because a worker that does *not* understand a `PING` treats it as an unknown
+// message type and exits — skipping one would misalign its reader. So a server that discovered the
+// capability by sending one would kill every worker it asked, and a server that assumed it would do
+// the same. Advertising is what makes `idle_ping_ms` safe to turn on.
+Assert::same(
+    true,
+    json_of($advertised['frames'], MessageType::HELLO_ACK)[0]['answers_ping'],
+    'the SDK tells the server it answers a PING, because the server must not probe for it',
+);
+
+// And the claim is true: a `PING` in the middle of a worker's life is answered with a `PONG`
+// carrying no request id. Driven through `run()` rather than a hand-written loop, because the
+// assertion worth making is that the real dispatch reaches this arm.
+$pinged = run_worker(
+    [
+        [MessageType::HELLO, 0, ['protocol_version' => 1]],
+        [MessageType::PING, 0, []],
+    ],
+    static fn () => Response::text('unused'),
+);
+$pongs = array_values(array_filter(
+    $pinged['frames'],
+    static fn (array $frame): bool => $frame['header']->messageType === MessageType::PONG,
+));
+Assert::same(1, count($pongs), 'a PING is answered with exactly one PONG');
+Assert::same(
+    Worker::UNSOLICITED,
+    $pongs[0]['header']->requestId,
+    'a PONG belongs to no exchange',
+);
+
 // A body with no declared length ends at `LAST`, and `$request->body` carries the bytes.
 $streamed = run_worker(
     [

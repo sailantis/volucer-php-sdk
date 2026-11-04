@@ -1648,6 +1648,16 @@ final class Worker implements CallPlane
             // `BODY` frame for its own response. One absent key would desynchronise every request,
             // which is why the party that has to cope is the one that advertises.
             'stream_request_body' => true,
+            // **This worker answers `PING` with `PONG`**, which `run()` has done since the first
+            // version — but the server could not know that, so it never sent one. Advertising it is
+            // what lets a deployment set `idle_ping_ms` and have a quiet pool kept alive.
+            //
+            // The direction of this rule is not politeness: a worker that does not understand
+            // `PING` does not ignore it, it exits (see `run()`'s `default:` arm — skipping an
+            // unknown frame would misalign the reader). So a server that probed for the capability
+            // by sending one would kill every worker it asked. The party that has to cope is the
+            // party that advertises, exactly as with `stream_request_body`.
+            'answers_ping' => true,
         ]);
 
         if ($offer) {

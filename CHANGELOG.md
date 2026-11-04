@@ -22,6 +22,16 @@ read-deadline bugs described under *Fixed*.
   memory until it is complete.
 - **Streamed request bodies** — a request whose length the server did not declare is read until
   the `BODY` frame marked `LAST`, rather than rejected.
+- **`answers_ping` is advertised in the `HELLO_ACK`.** The SDK has always answered a `PING` with a
+  `PONG`, but the server had no way to know that, so it never sent one — and it cannot find out by
+  trying, because a worker that does *not* understand a `PING` treats it as an unknown message type
+  and exits, since skipping one would misalign its reader. Announcing the capability is what lets a
+  deployment turn on the server's `idle_ping_ms`, which pings an idle connection so that a read
+  deadline cannot land on it. A worker on an older SDK simply never advertises it and is never
+  pinged, which is what it did before.
+
+  This pairs with the read-deadline fix below and does not replace it: that one makes the worker
+  tolerate a deadline, this one lets the server keep the deadline from arriving at all.
 
 ### Fixed
 
