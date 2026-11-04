@@ -1925,6 +1925,44 @@ final class Worker implements CallPlane
     }
 
     /**
+     * Read exactly `$length` bytes, waiting out an idle connection rather than failing on it.
+     *
+     * The payload counterpart of {@see Worker::readHeader}, and the same distinction: a short
+     * read means either "the connection ended mid-frame", which is a protocol failure and must
+     * be reported, or "the read deadline passed and the rest is still coming", which is an idle
+     * connection and must be waited out.
+     *
+     * Getting this wrong is quieter than it sounds. A payload that timed out half-read is
+     * reported as a truncated frame, which is a `ProtocolException`, which propagates out of
+     * `run()` and **kills the worker** — the same outcome as the header bug, reached through a
+     * different door, and one that only shows up when the server is slow rather than idle.
+     */
+    private function readExactly(int $length): string
+    {
+        $buffer = '';
+
+        while (strlen($buffer) < $length) {
+            $piece = stream_get_contents($this->in, $length - strlen($buffer));
+
+            if ($piece === false || $piece === '') {
+                if ($this->readTimedOut()) {
+                    continue;
+                }
+
+                throw new ProtocolException(sprintf(
+                    'a frame declared %d payload bytes but the stream ended after %d',
+                    $length,
+                    strlen($buffer),
+                ));
+            }
+
+            $buffer .= $piece;
+        }
+
+        return $buffer;
+    }
+
+    /**
      * Turn whatever the handler returned into a [`Response`].
      */
     private function normalise(mixed $result, string $captured): Response
@@ -2115,16 +2153,69 @@ final class Worker implements CallPlane
      * deliberate: it blocks until it has 16 bytes or the stream ends, handling
      * partial reads itself. Hand-rolling an `fread` loop is the bug-prone part
      * of every pipe protocol, and this call is why the SDK does not have one.
+     *
+     * **A timed-out read is not a closed connection, and this method used to conflate them.**
+     * PHP applies `default_socket_timeout` to reads on a socket stream — 60 seconds unless the
+     * deployment says otherwise — and `stream_get_contents()` returns `''` for a read that timed
+     * out *and* for a read that hit end-of-file. Reading the first as the second is not a
+     * cosmetic mistake: `null` here means "the server is finished with me", so `run()` returns,
+     * the worker exits, and the server sees one connection close where it expected an idle
+     * worker. With a pool of N attached workers and an idle gap longer than the timeout, **all N
+     * exit at once**, and the server answers the first request after the gap with a 502 while it
+     * rebuilds them.
+     *
+     * `feof()` is what separates the two, and it is free:
+     *
+     *     deadline hit, peer still open:  read=''  timed_out=true   feof=false
+     *     peer closed while waiting:      read=''  timed_out=false  feof=true
+     *
+     * So the loop below waits out a quiet connection and returns `null` only for a real close.
+     * `stream_get_meta_data()` is consulted as well, because `feof` is documented as "the last
+     * read hit EOF" rather than as a general predicate, and two independent readings of the same
+     * fact is the right number here.
+     *
+     * The alternative — a deployment setting `default_socket_timeout = -1` — also works. It cannot
+     * be relied on, though: a `-d` flag on the supervisor is invisible to the worker that inherits
+     * the connection, and `php-cgi`, a framework's own bootstrap or an application's `ini_set` can
+     * all put a deadline back. The deadline is a *policy* for how long a request may take, and the
+     * protocol already carries one (`request_timeout`, enforced by the server); a deadline on the
+     * idle read is a different thing and must not be able to end a worker.
      */
     private function readHeader(): ?Header
     {
-        $bytes = stream_get_contents($this->in, Header::HEADER_LEN);
+        while (true) {
+            $bytes = stream_get_contents($this->in, Header::HEADER_LEN);
 
-        if ($bytes === false || $bytes === '') {
-            return null;
+            if ($bytes === false || $bytes === '') {
+                if ($this->readTimedOut()) {
+                    // Nothing arrived and nobody left: the server is idle, not finished.
+                    continue;
+                }
+
+                return null;
+            }
+
+            return Header::decode($bytes);
+        }
+    }
+
+    /**
+     * Whether the last read hit its deadline with the connection still open.
+     *
+     * Two readings of one fact, because either alone is weaker than it looks: `feof` answers "is
+     * this stream at its end", which is false for a socket whose peer merely went quiet, and
+     * `timed_out` answers "did the last call run out of time". A read that returns `''` is one of
+     * those two, and getting it wrong in the "closed" direction kills a healthy worker.
+     */
+    private function readTimedOut(): bool
+    {
+        if (feof($this->in)) {
+            return false;
         }
 
-        return Header::decode($bytes);
+        $meta = @stream_get_meta_data($this->in);
+
+        return is_array($meta) && ($meta['timed_out'] ?? false);
     }
 
     /**
@@ -2146,15 +2237,7 @@ final class Worker implements CallPlane
             return '';
         }
 
-        $payload = stream_get_contents($this->in, $header->payloadLen);
-
-        if ($payload === false || strlen($payload) !== $header->payloadLen) {
-            throw new ProtocolException(sprintf(
-                'a frame declared %d payload bytes but the stream ended after %d',
-                $header->payloadLen,
-                $payload === false ? 0 : strlen($payload),
-            ));
-        }
+        $payload = $this->readExactly($header->payloadLen);
 
         if (!$header->declaresNoChecksum()) {
             $computed = Frame::crc32c($payload);
