@@ -7,9 +7,9 @@ All notable changes to `sailantis/volucer-worker` are recorded here. The format 
 Versions are also tagged in git, and `composer require` resolves to the highest tag — so a fix
 listed here as unreleased is not installed by anyone until the tag exists.
 
-## [Unreleased]
+## [0.3.0] - 2026-11-04
 
-Everything below is on `main` and is **not** in `0.2.0`. A deployment on `0.2.0` has the two
+Installed by `composer require` from this tag. A deployment still on `0.2.0` has the two
 read-deadline bugs described under *Fixed*.
 
 ### Added
@@ -94,6 +94,7 @@ different thing and must not be able to end a worker.
 
 First release: the worker protocol, the request/response exchange, and the supervisor.
 
-[Unreleased]: https://github.com/sailantis/volucer-php-sdk/compare/v0.2.0...main
+[Unreleased]: https://github.com/sailantis/volucer-php-sdk/compare/v0.3.0...main
+[0.3.0]: https://github.com/sailantis/volucer-php-sdk/releases/tag/v0.3.0
 [0.2.0]: https://github.com/sailantis/volucer-php-sdk/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/sailantis/volucer-php-sdk/releases/tag/v0.1.0
