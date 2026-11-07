@@ -13,7 +13,7 @@ The protocol link above is pinned to a commit rather than to a branch: a branch 
 silently start describing a later protocol than the one this release implements.
 
 It is **stdlib-only**. No extensions, no FFI, no build step, and no Composer requirement just to
-*run* a worker. The whole SDK is four small classes and a codec.
+_run_ a worker. The whole SDK is four small classes and a codec.
 
 ## What it is not
 
@@ -48,9 +48,9 @@ the protocol runs over that socket instead of stdio. Use `connect()` in a worker
 
 The variable carries either form, and `connect()` decides from its prefix:
 
-| value | transport |
-| --- | --- |
-| `127.0.0.1:34567` | loopback TCP — the ephemeral port the server bound |
+| value                             | transport                                                 |
+| --------------------------------- | --------------------------------------------------------- |
+| `127.0.0.1:34567`                 | loopback TCP — the ephemeral port the server bound        |
 | `unix:/run/volucer/worker.0.sock` | a unix socket, from `socket = "unix:/run/volucer/worker"` |
 
 `unix:` is the same convention the server's configuration uses for `external`, `attach` and the
@@ -76,11 +76,11 @@ small write until the first is acknowledged, TCP delays the acknowledgement by u
 the two processes do it to each other once per request. Measured on loopback with a
 protocol-shaped ping-pong:
 
-| | per request |
-|---|---|
-| TCP, Nagle on | **38.96 ms** |
-| TCP, `TCP_NODELAY` | **0.06 ms** |
-| AF_UNIX socket | 0.06 ms |
+|                    | per request  |
+| ------------------ | ------------ |
+| TCP, Nagle on      | **38.96 ms** |
+| TCP, `TCP_NODELAY` | **0.06 ms**  |
+| AF_UNIX socket     | 0.06 ms      |
 
 On the whole `/items` route this was the difference between a 2,334 rps arm and a 24 rps one. The
 server has always disabled Nagle on its side; this closes the same gap on the worker's.
@@ -92,7 +92,7 @@ every persistent-PHP protocol, so it is worth knowing they are handled for you.
 
 ### 1. stdout is the protocol channel
 
-Every frame goes to `php://stdout`. Anything the *application* writes there would land inside a
+Every frame goes to `php://stdout`. Anything the _application_ writes there would land inside a
 frame and desynchronise the stream permanently.
 
 So application output is not banned — it is **captured**:
@@ -106,7 +106,7 @@ The captured output becomes the response body when your handler returns `null`. 
 plain PHP script works as a worker without being changed** — if it echoes, that echo is the
 response. If your handler returns a `Response`, the captured output is discarded.
 
-To talk to the server *outside* a request, use `emitLog()` / `emitMetric()`. Those are the reason
+To talk to the server _outside_ a request, use `emitLog()` / `emitMetric()`. Those are the reason
 this protocol exists instead of using FastCGI: a worker can speak first.
 
 The residual risk is a write made directly to the `STDOUT` constant
@@ -122,7 +122,7 @@ catch** and no flag to poll — which is why the server never has to ask twice b
 
 ## Attaching instead of spawning
 
-The `worker` backend starts your process. The `attach` backend does not: it *dials* a relay that a
+The `worker` backend starts your process. The `attach` backend does not: it _dials_ a relay that a
 supervisor in your own process listens on, and holds one connection per slot. That is the shape that
 lets a supervisor fork its workers after booting the application once, so every child inherits the
 interpreter, the loaded classes and the OPcache segment instead of mapping them again.
@@ -168,7 +168,7 @@ Environment=VOLUCER_RELAY_SOCKET=unix:/run/app/workers.sock
 ```
 
 That is the counterpart of `VOLUCER_WORKER_SOCKET`, and it exists for the mirror-image reason. That
-one is set *by* the server on a child it spawned, so a supervisor cannot read it: no child was
+one is set _by_ the server on a child it spawned, so a supervisor cannot read it: no child was
 spawned, and the value there would be whatever an enclosing environment left behind. This one is
 set by the operator, and both sides read it. A value passed to `serve()`, or a `relay` key in the
 file, still wins — so a stale variable in a shell cannot move a deployment, and a hand-run
@@ -181,7 +181,7 @@ supervisor forks a replacement for the next connection. The supervisor reaps its
 long-lived one does not fill the process table with zombies.
 
 **`children` needs no tuning.** The third argument caps how many children may run at once, and the
-default (`0`) is *no cap*, which is what an `attach` deployment wants: volucer dials `workers` times
+default (`0`) is _no cap_, which is what an `attach` deployment wants: volucer dials `workers` times
 and holds one connection per slot, so the live children are already bounded by that number. A cap
 below `workers` is not a queue — the surplus dials sit unaccepted in the listen backlog while the
 pool waits for a handshake no child is there to send.
@@ -190,7 +190,7 @@ pool waits for a handshake no child is there to send.
 single process. Use `kind = "worker"` or `kind = "upstream"` on Windows.
 
 **Boot before the fork, connect after it.** A container, loaded classes and a warm template cache
-are inherited by every child, which is the saving. An *open database connection* must not be: every
+are inherited by every child, which is the saving. An _open database connection_ must not be: every
 child would inherit the socket and they would take turns reading from it. Open connections lazily,
 per child, on the first request — doctrine's `EntityManager` and PDO both do this already.
 
@@ -242,11 +242,11 @@ nobody is reading.
 
 The handler receives the `Request` and returns one of:
 
-| Return | Result |
-| --- | --- |
-| `Response` | sent exactly as given |
-| `string` | sent as a `200` `text/html` body |
-| `null` | the captured output becomes the body |
+| Return     | Result                               |
+| ---------- | ------------------------------------ |
+| `Response` | sent exactly as given                |
+| `string`   | sent as a `200` `text/html` body     |
+| `null`     | the captured output becomes the body |
 
 If the handler throws, the SDK logs it to stderr, answers `500`, and **keeps serving**. One bad
 request does not take the worker down.
@@ -270,24 +270,57 @@ Worker::create()->run(function (Request $request, Worker $worker): ?Response {
 
 ### `Request`
 
-| Member | Notes |
-| --- | --- |
-| `method`, `uri`, `protocol` | as sent |
-| `headers` | `name => value`; `header($name)` looks up case-insensitively |
-| `body` | the raw request body |
-| `contentType()` | shorthand for the `Content-Type` header |
-| `query()` | the query string parsed the way PHP populates `$_GET` |
-| `cookies()` | the `Cookie` header parsed the way PHP populates `$_COOKIE` |
-| `post()` | the form fields, the way PHP populates `$_POST` |
-| `files()` | the uploads, the way PHP populates `$_FILES` |
-| `serverVars()` | CGI-style variables derived from the request (for legacy code) |
-| `remoteAddr`, `scriptFilename`, `https` | as sent |
+| Member                                  | Notes                                                          |
+| --------------------------------------- | -------------------------------------------------------------- |
+| `method`, `uri`, `protocol`             | as sent                                                        |
+| `headers`                               | `name => value`; `header($name)` looks up case-insensitively   |
+| `body`                                  | the raw request body                                           |
+| `contentType()`                         | shorthand for the `Content-Type` header                        |
+| `query()`                               | the query string parsed the way PHP populates `$_GET`          |
+| `cookies()`                             | the `Cookie` header parsed the way PHP populates `$_COOKIE`    |
+| `post()`                                | the form fields, the way PHP populates `$_POST`                |
+| `files()`                               | the uploads, the way PHP populates `$_FILES`                   |
+| `serverVars()`                          | CGI-style variables derived from the request (for legacy code) |
+| `input()`                               | the `$_REQUEST` merge: form fields over the query string       |
+| `remoteAddr`, `scriptFilename`, `https` | as sent                                                        |
+
+### CGI superglobals
+
+By default, the SDK fills `$_SERVER`, `$_GET`, `$_POST`, `$_COOKIE`, `$_FILES` and `$_REQUEST` for every HTTP request, then clears them so one request's data cannot reach the next. This keeps `php-cgi` applications working unchanged.
+
+To skip this work, call `withoutCgiGlobals()` when connecting the worker:
+
+```php
+Worker::connect()->withoutCgiGlobals()->run($handler);
+```
+
+The `Request` API remains available either way. Only disable globals if the application does not rely on them.
+
+#### What `$_SERVER` contains, and what it cannot
+
+The worker protocol provides `script_filename`; other values are derived to match `php-cgi`:
+
+- **`SCRIPT_NAME` and `PHP_SELF`** contain the request path, not the script path. This matters for front-controller applications where the script path differs from the requested path.
+- **`DOCUMENT_ROOT`** is the directory of `script_filename`.
+- **`SERVER_ADDR` and `SERVER_PORT`** are omitted because the protocol does not provide the listener address.
+
+`$_REQUEST` merges form fields over query parameters; cookies are not included.
+
+#### A handler that calls `exit`
+
+If a handler calls `exit`, the SDK sends the captured response from a shutdown handler before the worker is replaced. Note these limitations:
+
+- **Status is `200` and `app_status` is `0`** because shutdown handlers cannot access the exit code.
+- **Headers cannot be recovered** under this SAPI; the response uses `text/html`.
+- **Output from later shutdown handlers is discarded** to protect the worker protocol stream.
 
 ### Uploads and forms
 
 `application/x-www-form-urlencoded` and `multipart/form-data` are both parsed, so
 `$request->post()` and `$request->files()` — and `$_POST` and `$_FILES` — are populated exactly as a
-`php-cgi` deployment would populate them. The parser is incremental: it consumes the body as the
+`php-cgi` deployment would populate them. As in a SAPI, only a `POST` is parsed and a `charset`
+parameter does not disqualify the type; both were confirmed against a real `php-cgi`. The parser is
+incremental: it consumes the body as the
 `BODY` frames arrive and writes each file part straight to its temp file, so **peak memory is the
 size of the largest text field, not the size of the upload**.
 
@@ -314,7 +347,7 @@ same one.
 
 **FFI does not solve it**, and it was measured rather than assumed. The engine does export
 `sapi_globals_id`, `sapi_globals_offset` and `zend_hash_str_add`, so the hash is reachable in
-principle — but `rfc1867_uploaded_files` is a *field* inside `sapi_globals_struct` whose offset is a
+principle — but `rfc1867_uploaded_files` is a _field_ inside `sapi_globals_struct` whose offset is a
 compile-time constant of one specific build, and no header ships with a binary PHP distribution to
 read it from. Writing a probe `zend_array` at the one plausible offset returned `false` from
 `is_uploaded_file()` and then killed the process with a heap-corruption exit; a structural scan for
@@ -330,14 +363,14 @@ call and works today.
 Everything downstream of the temp file works, because it operates on a path. What differs is only
 these two functions:
 
-| | `php-cgi` / `php-fpm` | worker |
-| --- | --- | --- |
-| `$_POST` / `$_FILES` populated | yes | yes |
-| `is_uploaded_file()`, `move_uploaded_file()` | yes | **no** |
-| `rename()`, `copy()`, `fopen()` | yes | yes |
-| Laravel `$file->store()`, `get()` | yes | yes |
-| Symfony `$file->move()`, `isValid()` | yes | yes, *through the bridge's flag — see below* |
-| PSR-7 / Spiral `moveTo()` | yes | yes (`Nyholm` uses `rename()` under `PHP_SAPI=cli`) |
+|                                              | `php-cgi` / `php-fpm` | worker                                              |
+| -------------------------------------------- | --------------------- | --------------------------------------------------- |
+| `$_POST` / `$_FILES` populated               | yes                   | yes                                                 |
+| `is_uploaded_file()`, `move_uploaded_file()` | yes                   | **no**                                              |
+| `rename()`, `copy()`, `fopen()`              | yes                   | yes                                                 |
+| Laravel `$file->store()`, `get()`            | yes                   | yes                                                 |
+| Symfony `$file->move()`, `isValid()`         | yes                   | yes, _through the bridge's flag — see below_        |
+| PSR-7 / Spiral `moveTo()`                    | yes                   | yes (`Nyholm` uses `rename()` under `PHP_SAPI=cli`) |
 
 So there is one call to use instead of `move_uploaded_file()`:
 
@@ -362,15 +395,16 @@ already branches on `PHP_SAPI`.
 #### What is deliberately a superset of PHP
 
 PHP consumes the body while parsing it, so `php://input` is **empty** for a multipart request under a
-SAPI. A worker keeps the raw bytes as well: `$request->body` is still the multipart body, *and*
+SAPI. A worker keeps the raw bytes as well: `$request->body` is still the multipart body, _and_
 `$_FILES` is populated. Applications that read `php://input`, or that parse multipart themselves,
 therefore keep working.
 
 #### Not populated
 
-`$_REQUEST` is left empty rather than guessed, because its contents depend on `request_order`, which
-the SDK cannot know. `$_ENV` likewise. `$_SESSION` is started by `session_start()` as usual, which
-reads `$_COOKIE` and works normally.
+`$_ENV` is left empty: it is a process setting `variables_order` decides, and a worker has no
+meaningful environment to project. `$_SESSION` is started by `session_start()` as usual, which reads
+`$_COOKIE` and works normally. `$_REQUEST` _is_ populated — see [the superglobals
+section](#the-superglobals-at-no-cost-to-the-request).
 
 ### `Response`
 
@@ -417,7 +451,7 @@ return StreamedResponse::events(static function (): \Generator {
   wire with its status, so there is no status left to change; the body simply stops without `LAST`
   and the client is told the transfer did not finish. Whatever was yielded before the failure is
   still sent.
-- **The closure runs before the head is sent**, so a factory that fails *immediately* is still a
+- **The closure runs before the head is sent**, so a factory that fails _immediately_ is still a
   `500` — only a failure part way through the body is unreportable.
 - **No `Content-Length`, and no compression.** Both need the whole body. A download that is a file
   is better served with `X-Sendfile`, whose response does carry a length and does support ranges.
@@ -427,18 +461,18 @@ return StreamedResponse::events(static function (): \Generator {
 
 ### `Worker`
 
-| Method | Purpose |
-| --- | --- |
-| `Worker::create($in?, $out?)` | bind explicit streams (default: stdio), force `display_errors=stderr` |
-| `Worker::connect()` | `create()`, but honour `VOLUCER_WORKER_SOCKET` when the server sets it (either `host:port` or `unix:/path`) |
-| `run($handler)` | handshake, then serve until EOF |
-| `emitLog($message, $level)` | one log record, unsolicited |
+| Method                             | Purpose                                                                                                                                       |
+| ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Worker::create($in?, $out?)`      | bind explicit streams (default: stdio), force `display_errors=stderr`                                                                         |
+| `Worker::connect()`                | `create()`, but honour `VOLUCER_WORKER_SOCKET` when the server sets it (either `host:port` or `unix:/path`)                                   |
+| `run($handler)`                    | handshake, then serve until EOF                                                                                                               |
+| `emitLog($message, $level)`        | one log record, unsolicited                                                                                                                   |
 | `emitMetric($name, $value, $unit)` | one metric sample, unsolicited. `$name` must be a Prometheus name (`[a-zA-Z_][a-zA-Z0-9_]*`) and declared in the server's `[metrics.collect]` |
-| `recycle()` | ask the server to replace this worker after the request |
-| `currentRequestId()` | the in-flight request id, for telemetry correlation |
-| `kv($storage = 'default')` | a handle to a key-value storage — see `docs/08-SERVICES.md` in the server |
-| `lock()` | a handle to the resource locks |
-| `queue($pipeline)` | a handle to a queue, from the producer's side |
+| `recycle()`                        | ask the server to replace this worker after the request                                                                                       |
+| `currentRequestId()`               | the in-flight request id, for telemetry correlation                                                                                           |
+| `kv($storage = 'default')`         | a handle to a key-value storage — see `docs/08-SERVICES.md` in the server                                                                     |
+| `lock()`                           | a handle to the resource locks                                                                                                                |
+| `queue($pipeline)`                 | a handle to a queue, from the producer's side                                                                                                 |
 
 ### `Rpc`
 
@@ -456,14 +490,14 @@ $id = $rpc->lock()->acquire('pdf:create');
 $rpc->queue('mail')->push('{"to":"a@b"}');
 ```
 
-| Method | Purpose |
-| --- | --- |
+| Method                                        | Purpose                                                     |
+| --------------------------------------------- | ----------------------------------------------------------- |
 | `Rpc::connect($address?, $token?, $timeout?)` | build one, from the request's environment unless overridden |
-| `call($name, $params)` | one round trip |
-| `kv()`, `lock()`, `queue()` | the same handles `Worker` returns |
-| `lastCallError()`, `lastCallWasUnknown()` | why a call failed, and whether it may have taken effect |
-| `close()` | drop the socket; the next call reconnects |
-| `address()` | which call plane this is, for a diagnostic |
+| `call($name, $params)`                        | one round trip                                              |
+| `kv()`, `lock()`, `queue()`                   | the same handles `Worker` returns                           |
+| `lastCallError()`, `lastCallWasUnknown()`     | why a call failed, and whether it may have taken effect     |
+| `close()`                                     | drop the socket; the next call reconnects                   |
+| `address()`                                   | which call plane this is, for a diagnostic                  |
 
 **Nothing has to be configured on this side.** The address and the backend's identity are put into
 the request by volucer — `VOLUCER_RPC` and `VOLUCER_RPC_TOKEN` as CGI parameters, or
@@ -475,9 +509,9 @@ Two consequences of the transport are worth knowing, and both differ from `Worke
 
 - **A call has a deadline.** `Worker::call()` blocks with none, because the protocol guarantees an
   answer and a timeout on a Windows pipe would need `stream_select`, which is meaningless there.
-  This client reads a *socket*, so `Rpc::connect(timeout: 30.0)` works and matters: a call that
+  This client reads a _socket_, so `Rpc::connect(timeout: 30.0)` works and matters: a call that
   legitimately takes longer than the default 10 s — a `lock()->acquire()` with a long `$wait` — needs
-  a deadline that covers it. `[rpc].call_timeout_seconds` is the *server's* write deadline and does
+  a deadline that covers it. `[rpc].call_timeout_seconds` is the _server's_ write deadline and does
   not govern how long you may wait.
 - **`lastCallWasUnknown()` is reachable on a path a worker never has.** A connection that breaks or
   times out after the call was written may still have been served; a connection that was never
@@ -490,13 +524,13 @@ The `attach` half, in its own class because it is a different call: `Worker` ser
 the server opened, and `Supervisor` serves many, forking one child each. See
 [Attaching instead of spawning](#attaching-instead-of-spawning).
 
-| Method | Purpose |
-| --- | --- |
-| `Supervisor::serve($relay, $handler, $children = 0)` | listen on `unix:/path` or `host:port`, fork per connection, block |
-| `Supervisor::listen($relay)` | bind only, for an application that owns its own accept loop |
-| `Supervisor::relayPath($relay)` | the path of a `unix:` relay, or `null` for a TCP one |
-| `Supervisor::grpcForkHazard()` | why a forking PHP will stall, or `null` — see [the grpc note](#attaching-instead-of-spawning) |
-| `Supervisor::UNIX_PREFIX` | `'unix:'` — volucer's convention, not PHP's |
+| Method                                               | Purpose                                                                                       |
+| ---------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| `Supervisor::serve($relay, $handler, $children = 0)` | listen on `unix:/path` or `host:port`, fork per connection, block                             |
+| `Supervisor::listen($relay)`                         | bind only, for an application that owns its own accept loop                                   |
+| `Supervisor::relayPath($relay)`                      | the path of a `unix:` relay, or `null` for a TCP one                                          |
+| `Supervisor::grpcForkHazard()`                       | why a forking PHP will stall, or `null` — see [the grpc note](#attaching-instead-of-spawning) |
+| `Supervisor::UNIX_PREFIX`                            | `'unix:'` — volucer's convention, not PHP's                                                   |
 
 `recycle()` is what an application calls when it has put itself into a state it cannot clean up —
 a leaked global, a stuck connection, a fat static cache. The server sees `keep_alive = false` in
@@ -510,13 +544,13 @@ missing: nothing reads the `Cookie` header, and `header()`/`setcookie()` cannot 
 `Set-Cookie` back. `Volucer\Session` does both, and every framework bridge should use it rather
 than reimplement it.
 
-| Method | Purpose |
-| --- | --- |
-| `begin($request)` | adopt the session the request presented, and relax PHP's cookie handling |
+| Method                       | Purpose                                                                            |
+| ---------------------------- | ---------------------------------------------------------------------------------- |
+| `begin($request)`            | adopt the session the request presented, and relax PHP's cookie handling           |
 | `beginWithCookies($cookies)` | the same, for a request that is not a `Volucer\Request` (PSR-7, a framework's own) |
-| `applyTo($response)` | **add the `Set-Cookie` and end the request** — the normal call |
-| `cookie()` | the `Set-Cookie` value alone, for a response object this SDK does not own |
-| `end()` | end the session and forget the id, if you did not use `applyTo()` |
+| `applyTo($response)`         | **add the `Set-Cookie` and end the request** — the normal call                     |
+| `cookie()`                   | the `Set-Cookie` value alone, for a response object this SDK does not own          |
+| `end()`                      | end the session and forget the id, if you did not use `applyTo()`                  |
 
 ```php
 $session = new Session();
@@ -533,7 +567,7 @@ $handler = static function (Request $request, Worker $worker) use ($session): Re
 
 **`applyTo()` ends the request as well, deliberately.** `session_id()` outlives the request, so a
 client arriving with no cookie would otherwise inherit the previous client's session — and reading
-the id *after* ending the session yields `''`, which means a caller that gets the order wrong drops
+the id _after_ ending the session yields `''`, which means a caller that gets the order wrong drops
 the cookie **silently**: the session is created on every request, and nothing logs a word. Fusing
 the two removes the opportunity. Calling `end()` as well is harmless.
 
@@ -663,11 +697,11 @@ that ignores it behaves exactly as before.
 
 `Worker::build()` asks Composer about this package **by name** — the three cases that produces:
 
-| Situation | `build()` | Why |
-| --- | --- | --- |
-| Installed as a release | `0.1.1+7c6945f` | The version names it, the commit pins it exactly |
-| A `dev-main` requirement | `7c6945f` | No meaningful version, so the commit *is* the build |
-| No Composer at all | `unknown` | A bare `php worker.php` never went through Composer |
+| Situation                | `build()`       | Why                                                 |
+| ------------------------ | --------------- | --------------------------------------------------- |
+| Installed as a release   | `0.1.1+7c6945f` | The version names it, the commit pins it exactly    |
+| A `dev-main` requirement | `7c6945f`       | No meaningful version, so the commit _is_ the build |
+| No Composer at all       | `unknown`       | A bare `php worker.php` never went through Composer |
 
 It is asked by name rather than through `getRootPackage()`, which returns the **consuming application** —
 that would report the host's build under the worker's own name, which is a plausible-looking answer and the
@@ -680,7 +714,7 @@ every change. The commit identifies the build, and it is the same reference a co
 `composer.lock` pins — so what a worker reports is what the application can be reproduced from.
 
 The protocol version and the build move independently: a fix that changes no wire behaviour is a new commit,
-while a wire change is a protocol version *and* a release.
+while a wire change is a protocol version _and_ a release.
 
 The SDK relies on `stream_get_contents($stream, $n)` for exact reads, which blocks until it has
 `$n` bytes or reaches EOF and handles partial reads internally. That is deliberate: hand-rolling

@@ -5,15 +5,10 @@ declare(strict_types=1);
 namespace Volucer;
 
 /**
- * A decoded frame header: the 16 bytes that precede a payload.
+ * Decoded 16-byte frame header. Wire fields are little-endian; golden fixtures in
+ * tests/WireFormatTest.php verify compatibility with the server.
  *
- * This is a direct transliteration of `Header::decode` in
- * `crates/volucer-worker/src/header.rs` of the volucer server
- * (`sailantis/volucer`). The two ends are held together by the
- * golden fixtures in tests/WireFormatTest.php, so a change to one that is not
- * mirrored in the other fails there rather than in production.
- *
- * Layout, little-endian:
+ * Layout:
  *
  *   offset size field
  *   0      4    payload_len
@@ -37,25 +32,13 @@ final class Header
     /** The sender is reporting a failure. */
     public const FLAG_ERROR = 0x0008;
     /**
-     * The `crc32c` field is not meaningful and must not be verified.
-     *
-     * Both ends must have agreed to this at the handshake; a frame that raises it without
-     * agreement is a protocol violation, which [`Worker`] refuses. The field itself is still
-     * written (as zero) so the header stays 16 bytes.
-     *
-     * A flag rather than a zero checksum, because zero is already a real checksum:
-     * `crc32c('') === 0`, which every empty-payload frame carries. Using zero as the sentinel
-     * would make a correctly-checksummed `HELLO` or `END` indistinguishable from an unchecked
-     * one, and would let corruption of the checksum field itself disable the check.
+     * The checksum is omitted. This requires handshake agreement; the field remains present and
+     * zeroed. A flag is needed because zero is a valid CRC32C value (including for empty payloads).
      */
     public const FLAG_NO_CHECKSUM = 0x0010;
     /**
-     * The `RESPONSE` head describes a body whose length is not declared.
-     *
-     * See {@see StreamedResponse}. A flag rather than "a zero `body_len` means unknown", because
-     * `body_len: 0` is already a correctly empty body — a `204`, a `HEAD` — and a reader that treated
-     * every zero as "stream me bytes" would consume the next request's frames as this response's body.
-     * The same reasoning {@see FLAG_NO_CHECKSUM} documents for its own sentinel.
+     * The response body length is unknown; see {@see StreamedResponse}. A flag distinguishes this
+     * from a valid empty body.
      */
     public const FLAG_STREAMED = 0x0020;
 
@@ -69,16 +52,7 @@ final class Header
     }
 
     /**
-     * Parse a header, which must be exactly 16 bytes.
-     *
-     * Exactly — not "at least". The read loop satisfies this by asking the
-     * stream for 16 bytes and never holding more, which is the whole reason the
-     * SDK does not hand-roll a partial-read loop: `stream_get_contents($h, 16)`
-     * blocks until it has 16 bytes or reaches EOF, handling short reads
-     * internally and leaving nothing behind to steal from the payload.
-     *
-     * Anything shorter is an error, never a clean close: silently treating a
-     * stream that died mid-header as ended would hide a truncated frame.
+     * Parse an exactly 16-byte header. Short or oversized input is a truncated or malformed frame.
      */
     public static function decode(string $bytes): self
     {
@@ -108,8 +82,7 @@ final class Header
             );
         }
 
-        // Refused rather than misread: with no codec negotiated, a "compressed"
-        // payload would be handed to json_decode as if it were plain text.
+        // No compression codec is negotiated, so compressed data cannot be decoded safely.
         if (($fields['flags'] & self::FLAG_COMPRESSED) !== 0) {
             throw new ProtocolException('refusing a compressed frame: no codec is negotiated');
         }
@@ -129,10 +102,7 @@ final class Header
     }
 
     /**
-     * Whether this frame declares that its `crc32c` field is not a checksum.
-     *
-     * The writer's *claim*, not a permission: whether it may be believed is the reader's
-     * decision, and [`Worker::readPayload`] refuses one the handshake never agreed to.
+     * Whether the frame declares its checksum omitted. The reader must verify handshake agreement.
      */
     public function declaresNoChecksum(): bool
     {

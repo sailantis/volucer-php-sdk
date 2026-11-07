@@ -5,39 +5,10 @@ declare(strict_types=1);
 namespace Volucer;
 
 /**
- * An incremental `multipart/form-data` parser.
+ * Incremental multipart/form-data parser for worker requests.
  *
- * ## Why this exists, and why it is incremental
- *
- * Under a SAPI, PHP parses this format itself, inside `php_request_startup`, and fills
- * `$_POST` and `$_FILES`. A worker is not a SAPI, so nothing parses it for us. The obvious
- * approach — concatenate the body, then parse the string — is exactly what this class exists
- * to avoid: the request body arrives in 64 KiB `BODY` frames, and holding it whole makes peak
- * memory proportional to the upload.
- *
- * So the bytes are fed in as they arrive, and two things happen to them:
- *
- * - A **file part** is written straight to its temporary file. Only a rolling window large
- *   enough to recognise a boundary is ever held in memory.
- * - A **text part** is accumulated, because a `$_POST` value is a string and there is nowhere
- *   else for it to go. That is bounded by `post_max_size`, the same bound PHP applies, so a
- *   form with a pathological text field fails here exactly where it would fail under a SAPI.
- *
- * ## What "correct" means here
- *
- * `php-cgi` is the specification, not the RFC. Where the two disagree this follows PHP, and
- * each such place says so. `tests/fixtures/multipart.php` runs the same payloads through a
- * real `php-cgi` and through this class and asserts the resulting `$_POST` / `$_FILES` are
- * identical — including the *transposed* shape `$_FILES` really has, where `a[b]` becomes
- * `$_FILES['a']['name']['b']` rather than the other way round.
- *
- * ## The one place this deliberately differs from a SAPI
- *
- * PHP consumes the body while parsing it, so `php://input` is empty for a multipart request.
- * A worker keeps the raw body as well (see `Worker::serve()`), so `$request->body` remains the
- * bytes the client sent *and* `$_FILES` is populated. That is a superset of PHP rather than a
- * divergence to be fixed: an application that parsed multipart itself would otherwise lose
- * the data, and every existing consumer of `$request->body` would break.
+ * File parts are streamed to temporary files; text fields are bounded by
+ * `post_max_size`. The resulting `$_POST` and transposed `$_FILES` shapes follow PHP.
  */
 final class Multipart
 {
@@ -124,18 +95,11 @@ final class Multipart
         }
     }
 
-    /**
-     * Feed the next slice of the body.
-     *
-     * Safe to call with any slice size, including one byte at a time: nothing is assumed about
-     * where a boundary or a header ends relative to a call.
-     */
+    /** Feed the next body slice; boundaries may span calls. */
     public function feed(string $bytes): void
     {
         if ($this->state === self::STATE_DONE || $this->failure !== null) {
-            // Bytes past the closing boundary are the epilogue, which PHP discards. Not
-            // consuming them keeps the buffer from growing when a body is longer than the
-            // frames promised — the caller already has a length check for that.
+            // PHP discards epilogue bytes; leave them to the caller's body-length check.
             return;
         }
 
@@ -156,41 +120,25 @@ final class Multipart
         }
 
         if ($this->state !== self::STATE_DONE) {
-            // PHP answers 400 for a body with no closing boundary. Reporting it rather than
-            // inventing a partial set of files is the same choice: a truncated set of files
-            // cannot be told from "the client sent fewer files".
+            // Reject incomplete bodies instead of returning partial form data.
             $this->discardParts();
             throw new ProtocolException('the multipart body ended without its closing boundary');
         }
     }
 
-    /**
-     * The `$_POST` equivalent.
-     *
-     * @return array<string, mixed>
-     */
+    /** @return array<string, mixed> Parsed form fields. */
     public function post(): array
     {
         return $this->post;
     }
 
-    /**
-     * The `$_FILES` equivalent, in PHP's exact — transposed — shape.
-     *
-     * @return array<string, mixed>
-     */
+    /** @return array<string, mixed> Uploaded files in PHP's transposed shape. */
     public function files(): array
     {
         return $this->files;
     }
 
-    /**
-     * Delete every temporary file this parser created and nobody has moved.
-     *
-     * Called by the worker at the end of a request. A file the application moved with
-     * {@see Uploads::move()} is no longer at its `tmp_name`, so the unlink fails harmlessly —
-     * which is why this can be unconditional.
-     */
+    /** Delete temporary files that the application has not moved. */
     public function cleanup(): void
     {
         foreach ($this->tempFiles as $path) {
@@ -221,20 +169,15 @@ final class Multipart
     }
 
     /**
-     * Discard everything before the first boundary, then consume that boundary.
+     * Find the opening boundary and switch to its line state.
      *
-     * Leaving this state as soon as the boundary token is matched — rather than trying to also
-     * consume the rest of its line here — is what makes one-byte slices work. The alternative
-     * was to stay in this state until the line ended, which then re-searched the buffer for an
-     * opening boundary and threw the next part's bytes away.
-     *
-     * @return bool whether there is progress and the loop should continue
+     * @return bool whether parsing can continue
      */
     private function pumpPreamble(): bool
     {
         $at = strpos($this->buffer, $this->opening);
         if ($at === false) {
-            // Keep only enough to recognise a boundary split across two slices.
+            // Retain a possible partial boundary.
             $this->keepTail(strlen($this->opening) + 2);
 
             return false;
@@ -247,12 +190,9 @@ final class Multipart
     }
 
     /**
-     * Consume the rest of a boundary's line.
+     * Consume a boundary line, including optional transport padding.
      *
-     * Two forms are possible: `--` closes the body, and a line ending opens the next part. A
-     * body may also carry transport padding — spaces or tabs — before the line ending.
-     *
-     * @return bool whether there is progress and the loop should continue
+     * @return bool whether parsing can continue
      */
     private function pumpBoundaryLine(): bool
     {
@@ -275,9 +215,7 @@ final class Multipart
         }
 
         if (substr($this->buffer, $cursor, 2) !== "\r\n") {
-            // Neither a closer nor a line ending. PHP reads this as a boundary inside part
-            // content rather than a delimiter, and a body like that is not something a client
-            // produces.
+            // A boundary must be followed by a closing marker or line ending.
             $this->failure = 'a multipart boundary was not followed by a line ending';
 
             return false;
@@ -295,8 +233,7 @@ final class Multipart
         $end = strpos($this->buffer, "\r\n\r\n");
         if ($end === false) {
             if (strlen($this->buffer) > 64 * 1024) {
-                // A header block that never ends is not multipart, or is far larger than any
-                // real part's headers.
+                // Reject an unterminated or oversized header block.
                 $this->failure = 'a multipart part header block did not end';
             }
 
@@ -316,9 +253,7 @@ final class Multipart
     {
         $at = $this->findDelimiter();
         if ($at === null) {
-            // No complete delimiter in what we hold, so everything except a possible truncated
-            // one is part content. Holding back the delimiter's length plus two bytes for the
-            // `--` that may follow it is what makes this work when a boundary straddles slices.
+            // Keep a possible partial delimiter in the buffer.
             $safe = strlen($this->buffer) - strlen($this->delimiter) - 2;
             if ($safe > 0) {
                 $this->writePart(substr($this->buffer, 0, $safe));
@@ -332,21 +267,16 @@ final class Multipart
         $this->buffer = substr($this->buffer, $at + strlen($this->delimiter));
         $this->closePart();
 
-        // The delimiter's own line is consumed by `pumpBoundaryLine`, which is the same code
-        // that consumes the body's first boundary. Keeping it in one place is what stops the
-        // two from disagreeing about padding or about the `--` closer.
+        // Parse all boundary lines using the same state handler.
         $this->state = self::STATE_BOUNDARY_LINE;
 
         return true;
     }
 
     /**
-     * The offset of the next *real* delimiter in the buffer, or null.
+     * Find the next delimiter followed by `--` or a line ending.
      *
-     * A byte sequence matching the delimiter is only a delimiter when what follows it is `--`
-     * or a line ending. A file whose content happens to contain `CRLF--boundary` followed by
-     * something else must not be truncated there — the classic multipart bug, and the reason
-     * this is a search loop rather than a single `strpos`.
+     * @return int|null delimiter offset
      */
     private function findDelimiter(): ?int
     {
@@ -362,8 +292,7 @@ final class Multipart
 
             $after = $at + $length;
             if ($total - $after < 2) {
-                // Not enough bytes to decide. Waiting is right: emitting these bytes as content
-                // would corrupt the part if they turn out to be a delimiter.
+                // Wait until enough bytes arrive to classify the candidate.
                 return null;
             }
 
@@ -383,8 +312,7 @@ final class Multipart
                 return $at;
             }
 
-            // A coincidence inside part content. Keep looking one byte on, so an overlapping
-            // candidate is not skipped.
+            // This match is part content; check for overlapping candidates.
             $from = $at + 1;
         }
     }
@@ -429,16 +357,12 @@ final class Multipart
 
         if ($disposition !== null) {
             $params = self::dispositionParams($disposition);
-            // Without a `name` a part cannot be placed in either superglobal, and PHP skips it.
+            // PHP skips unnamed parts.
             $this->partName = $params['name'] ?? '';
-            // A file part is one that carries a `filename`, *including* an empty one — that is
-            // how a browser submits a file input the user left blank, and PHP reports it as
-            // `UPLOAD_ERR_NO_FILE` rather than treating it as a text field. So the presence of
-            // the parameter, not its value, is what decides.
+            // An empty filename still identifies a file part; PHP reports it as NO_FILE.
             $this->partIsFile = array_key_exists('filename', $params);
             $this->partFilename = $params['filename'] ?? '';
-            // PHP 8.1 added `full_path`, carrying the client's directory structure so a form
-            // posting `dir[]` can be reconstructed. It falls back to the filename.
+            // Preserve the submitted path when available.
             $this->partFullPath = $params['full_path'] ?? $this->partFilename;
         }
 
@@ -450,8 +374,7 @@ final class Multipart
     private function openFilePart(): void
     {
         if ($this->fileCount >= $this->maxFiles) {
-            // PHP's `max_file_uploads`: past the limit the part is refused with
-            // `UPLOAD_ERR_NO_FILE` rather than the whole request failing.
+            // PHP reports excess files as UPLOAD_ERR_NO_FILE.
             $this->refusePart(UPLOAD_ERR_NO_FILE);
 
             return;
@@ -461,8 +384,7 @@ final class Multipart
         $dir = self::uploadTmpDir();
         $path = @tempnam($dir, 'php');
         if ($path === false) {
-            // PHP distinguishes `UPLOAD_ERR_NO_TMP_DIR` (missing) from `UPLOAD_ERR_CANT_WRITE`
-            // (unwritable). `tempnam` cannot, so the directory is tested first.
+            // Distinguish a missing directory from an unwritable one.
             $this->refusePart(is_dir($dir) ? UPLOAD_ERR_CANT_WRITE : UPLOAD_ERR_NO_TMP_DIR);
 
             return;
@@ -503,18 +425,12 @@ final class Multipart
 
         $this->partText .= $bytes;
         if ($this->postMaxSize > 0 && strlen($this->partText) > $this->postMaxSize) {
-            // PHP refuses the whole request rather than one field, because `$_POST` has no way
-            // to represent "this field was too big".
+            // PHP rejects the whole request when post_max_size is exceeded.
             $this->failure = 'a form field exceeded post_max_size';
         }
     }
 
-    /**
-     * Abandon the open file part and remember why.
-     *
-     * The file is deleted and its name recorded as `''`, which is what PHP reports for a part
-     * it could not keep.
-     */
+    /** Close and delete the current file part, recording its upload error. */
     private function refusePart(int $error): void
     {
         if ($this->partHandle !== null) {
@@ -560,7 +476,7 @@ final class Multipart
         $this->partHandle = null;
 
         if ($this->partFilename === '') {
-            // A blank file input: PHP names no temp file and reports `UPLOAD_ERR_NO_FILE`.
+            // Empty filenames have no temporary file in PHP.
             if ($this->partPath !== null) {
                 @unlink($this->partPath);
                 $this->tempFiles = array_values(array_filter(
@@ -578,16 +494,9 @@ final class Multipart
     }
 
     /**
-     * Record one `$_FILES` entry.
+     * Record a file using PHP's transposed `$_FILES` shape.
      *
-     * `$_FILES` is **transposed** relative to every other PHP array, and this is the detail a
-     * hand-written test gets wrong: `name="a[b]"` produces
-     *
-     *     $_FILES['a']['name']['b'], $_FILES['a']['type']['b'], …
-     *
-     * not `$_FILES['a']['b']['name']`. The field name is the outer key, the six leaf keys are
-     * inner, and only the *rest* of the name path nests below them. Verified against php-cgi
-     * rather than against the documentation.
+     * For `name="a[b]"`, the nested key appears below each file attribute.
      */
     private function recordFile(string $path, int $error, int $size): void
     {
@@ -623,8 +532,7 @@ final class Multipart
 
                 continue;
             }
-            // A bracketed field nests *below* the leaf key, so this key's branch has to exist
-            // before anything can be folded into it.
+            // Nest bracketed field names below each file attribute.
             if (!isset($this->files[$field][$key]) || !is_array($this->files[$field][$key])) {
                 $this->files[$field][$key] = [];
             }
@@ -635,16 +543,7 @@ final class Multipart
     // ------------------------------------------------------------------ PHP's array folding
 
     /**
-     * Assign `$value` into `$target` at a parsed path, the way PHP's own parser does.
-     *
-     * `parse_str` already implements this for a string payload, but there is no way to fold a
-     * *pre-built value* — a file leaf, whose `tmp_name` is a path and whose `size` is an int —
-     * into an existing array through it. So the rule is restated here, and the fixture test is
-     * what keeps it honest.
-     *
-     * Takes a **path** rather than a name. An earlier version re-serialised the path into
-     * `[b][]` notation and re-parsed it, which silently dropped a path that was nothing but an
-     * append (`name="f[]"`) — the exact shape a repeated file field has.
+     * Assign a value at a parsed PHP array path, including append segments.
      *
      * @param array<string, mixed> $target
      * @param list<string|null> $path
@@ -683,10 +582,7 @@ final class Multipart
     }
 
     /**
-     * Split `a[b][][c]` into `['a', 'b', null, 'c']`, or `['a']` for a plain name.
-     *
-     * `null` is PHP's numeric append. A name with no brackets is a single key even if it
-     * contains dots or spaces, which is why this is not a query-string parser.
+     * Split a bracketed field name into path segments; null represents `[]`.
      *
      * @return list<string|null>|null
      */
@@ -727,8 +623,7 @@ final class Multipart
         if ($boundary === null || $boundary === '') {
             return null;
         }
-        // RFC 2046 caps a boundary at 70 characters. Refusing a longer one rather than
-        // searching for it keeps a hostile `Content-Type` from making a long slice expensive.
+        // RFC 2046 limits boundary length to 70 characters.
         if (strlen($boundary) > 70) {
             return null;
         }
@@ -767,10 +662,7 @@ final class Multipart
     }
 
     /**
-     * Parse `; key=value; key="quoted \"value\""` into a map.
-     *
-     * Hand-written rather than `parse_str`, because a disposition parameter is not a query
-     * string: `filename="a b;c.txt"` must stay one value, and `parse_str` would split it.
+     * Parse semicolon-separated parameters, preserving quoted values.
      *
      * @return array<string, string>
      */
@@ -829,13 +721,7 @@ final class Multipart
         return $params;
     }
 
-    /**
-     * The directory a file part is written to.
-     *
-     * `upload_tmp_dir` first, because that is what an application's `ini_get()` reports and
-     * what its own cleanup code assumes; `sys_get_temp_dir()` is PHP's fallback and so this
-     * one. The `php` prefix matches what php-cgi produces.
-     */
+    /** Return PHP's upload temp directory, falling back to the system temp directory. */
     public static function uploadTmpDir(): string
     {
         $dir = ini_get('upload_tmp_dir');

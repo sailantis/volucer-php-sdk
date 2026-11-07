@@ -5,10 +5,7 @@ declare(strict_types=1);
 namespace Volucer;
 
 /**
- * A frame ready to send: a message type, a request id, and a payload.
- *
- * The write side of the codec. It only ever produces bytes; decoding is
- * [`Header::decode`] plus the payload reader in [`Worker`].
+ * Outbound protocol frame containing a message type, request id, and payload.
  */
 final class Frame
 {
@@ -21,20 +18,10 @@ final class Frame
     }
 
     /**
-     * Serialize to header + payload.
+     * Encode the 16-byte little-endian header followed by the payload.
      *
-     * `pack('VCCvVV', …)` lays the six fields out little-endian at the right
-     * offsets: 4 + 1 + 1 + 2 + 4 + 4 = 16 bytes.
-     *
-     * `$checksum` is passed in rather than remembered here, because the decision belongs to the
-     * [`Worker`] that made the handshake agreement — a `Frame` is built by application-adjacent
-     * code that has no business choosing a policy, and a process-wide switch would be state
-     * that outlives the worker which set it.
-     *
-     * With the checksum off the field is written as zero and `FLAG_NO_CHECKSUM` is raised, which
-     * is what makes the zero mean "not a checksum" rather than "the checksum of an empty
-     * payload" — see [`Header::FLAG_NO_CHECKSUM`]. The saving is the whole point: `crc32c` walks
-     * every payload byte, and a response body is the largest payload the protocol carries.
+     * The worker supplies the checksum policy negotiated at handshake. When disabled, the checksum
+     * is zeroed and {@see Header::FLAG_NO_CHECKSUM} marks it as omitted.
      */
     public function encode(bool $checksum = true): string
     {
@@ -50,16 +37,10 @@ final class Frame
     }
 
     /**
-     * CRC-32C (Castagnoli) as the 32-bit value the header carries.
+     * Return the CRC-32C value as a little-endian 32-bit integer.
      *
-     * `hash('crc32c', …)` returns the digest big-endian, so the raw digest is
-     * reversed to get the little-endian integer. Deliberately not
-     * `hexdec(hash(...))` followed by `pack('V', …)`: on a 32-bit PHP build
-     * `hexdec` returns a *float* once the top bit is set, which silently
-     * corrupts the checksum. `strrev` is exact everywhere.
-     *
-     * The check value is the standard one, and it is what Rust's `crc32c`
-     * computes too: `crc32c("123456789") === 0xE3069283`.
+     * Reversing the raw digest avoids float conversion on 32-bit PHP. The standard check value is
+     * `crc32c("123456789") === 0xE3069283`.
      */
     public static function crc32c(string $data): int
     {

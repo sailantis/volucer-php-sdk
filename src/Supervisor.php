@@ -5,102 +5,24 @@ declare(strict_types=1);
 namespace Volucer;
 
 /**
- * A prefork supervisor for volucer's `attach` backend.
+ * Prefork supervisor for Volucer's `attach` backend.
  *
- * The other half of `attach`. volucer only *dials* a relay in this mode — it starts no process
- * at all — because the fork has to happen in the application's own process: a PHP process cannot
- * hand a file descriptor to another process (`ext/sockets` has no `SCM_RIGHTS`), so the side that
- * owns the listening socket has to be the side that owns the fork. This class is that side.
+ * Listens on the relay and forks one child per connection. Requires Unix and `pcntl`.
+ * Initialize the application before `serve()` and open persistent connections lazily
+ * in each child.
  *
- * ```php
- * require __DIR__ . '/vendor/autoload.php';
- *
- * $app = new App();
- * $app->bootstrap();                 // boot before the fork, or each child boots its own
- *
- * Volucer\Supervisor::serve(
- *     'unix:/run/app/workers.sock',
- *     static fn (Volucer\Request $request): Volucer\Response => $app->handle($request),
- * );
- * ```
- *
- * ```toml
- * [backends.app]
- * kind    = "attach"
- * relay   = "unix:/run/app/workers.sock"
- * workers = 16
- * ```
- *
- * The relay may also be `host:port`, which is what a supervisor in another container needs;
- * `unix:` matters because a loopback TCP relay pays Nagle/delayed-ACK unless both ends disable it,
- * and an `AF_UNIX` socket has no Nagle to disable. [`Supervisor::listen`] sets `tcp_nodelay` on a
- * TCP listener, which every accepted connection inherits, so a child is never left to set it.
- *
- * **Unix only.** Windows has no `pcntl`, and `serve()` refuses there rather than silently degrading
- * to one process. On Windows use `kind = "worker"` (volucer spawns the processes) or
- * `kind = "upstream"`.
- *
- * **Boot before the fork.** Whatever the handler closes over is inherited by every child — the
- * container, loaded classes, the OPcache segment — so build it before calling `serve()`. What must
- * *not* be built before the fork is an open connection: every child would inherit it and they would
- * take turns reading from it. Open those per child, lazily, on the first request.
- *
- * **A PHP that loads `grpc` must be started with `GRPC_ENABLE_FORK_SUPPORT=1`.**
- *
- * `grpc` starts an executor, a resolver and a timer thread when its module initialises. A `fork()`
- * after that inherits those threads' locks, and the child deadlocks the first time it calls
- * `exit()` — inside grpc's own module shutdown. The symptom is not a crash: the child stays in
- * state `S` on a futex for ever, so `SIGCHLD` never fires, the master never reaps it, and a
- * supervisor that caps `children` stops accepting. Measured on a machine whose CLI PHP loads grpc:
- * nine stuck children after eight recycles, and none with the variable set.
- *
- * It has to be an environment variable, not `-d grpc.enable_fork_support=1` and not `putenv()` from
- * PHP: grpc starts those threads in its module init, which runs before any script does, so a value
- * set from PHP changes what `--ri grpc` reports and nothing else. Measured — `putenv()` at the top
- * of the script still leaves the child stuck (`exit()` never returns), while the same variable in
- * the environment lets it exit and be reaped.
- *
- * ```ini
- * # worker.service
- * Environment=GRPC_ENABLE_FORK_SUPPORT=1
- * ```
- *
- * ```bash
- * GRPC_ENABLE_FORK_SUPPORT=1 php supervisor.php    # or in the container's environment
- * ```
- *
- * `Supervisor::serve()` cannot do this for you, because the threads already exist by the time any
- * PHP code runs. It reports the hazard in {@see Supervisor::grpcForkHazard()} so a caller can log
- * it rather than discover it as a stalled pool.
+ * If PHP loads `grpc`, set `GRPC_ENABLE_FORK_SUPPORT=1` in the environment before
+ * startup; see {@see Supervisor::grpcForkHazard()}.
  */
 final class Supervisor
 {
     /** The `unix:` prefix volucer's configuration uses for a path relay. */
     public const UNIX_PREFIX = 'unix:';
 
-    /**
-     * The environment variable naming the relay an `attach` backend dials.
-     *
-     * The counterpart of [`Worker::SOCKET_ENV`], and for the same purpose: one address both halves
-     * of a deployment have to agree on, written once. The difference is direction. That variable is
-     * set *by* the server, on a child it spawned, so a supervisor cannot use it — there is no
-     * spawned child, and the value there would be whatever an enclosing environment happened to
-     * leave. This one is set by the *operator*, in the unit file or the container environment, and
-     * both the server and the supervisor read it.
-     */
+    /** Environment variable shared by the attach server and supervisor for the relay address. */
     public const RELAY_ENV = 'VOLUCER_RELAY_SOCKET';
 
-    /**
-     * The relay to listen on: the argument, else the environment, else `null`.
-     *
-     * `null` rather than an exception, because whether a missing relay is an error depends on the
-     * caller. [`Supervisor::serve`] takes `null` to mean the caller should fail with a message
-     * naming both places; a test or an embedding application may want to decide for itself.
-     *
-     * The trimming rule is [`Worker::socketAddress`]'s, deliberately: an empty value is what a
-     * shell produces from `VOLUCER_RELAY_SOCKET=`, and reporting it as an empty address would
-     * send the operator looking for a typo in a file that never mentions the key.
-     */
+    /** Resolve the relay from the argument or environment, returning null if unset. */
     public static function relay(?string $relay = null): ?string
     {
         if ($relay !== null) {
@@ -122,13 +44,7 @@ final class Supervisor
         return $address === '' ? null : $address;
     }
 
-    /**
-     * How long `accept` waits before the master reaps children and looks again.
-     *
-     * It costs a caller nothing: `accept` returns the instant a connection is pending, so this only
-     * bounds how long the master sleeps when no traffic is arriving — which is exactly when it
-     * needs to be reaping. The same figure as the Python and Ruby supervisors.
-     */
+    /** Maximum time accept waits before the supervisor reaps children, in seconds. */
     private const ACCEPT_TIMEOUT = 0.5;
 
     /** How long to wait when every child slot is busy, in microseconds. */
@@ -152,13 +68,7 @@ final class Supervisor
     }
 
     /**
-     * Bind and listen on a relay, removing a stale socket file first.
-     *
-     * A unix socket path is a *file*, and binding one that already exists fails with `EADDRINUSE` —
-     * so a supervisor restarted after a crash could never come up. Unlinking first is what every
-     * Unix server does, and it is safe here because this process is meant to be the only listener
-     * on that path: a live supervisor would hold the socket, and the bind would fail rather than
-     * two processes sharing one relay.
+     * Bind and listen on a relay, removing a stale Unix socket file first.
      *
      * @return resource
      */
@@ -230,31 +140,14 @@ final class Supervisor
     }
 
     /**
-     * Listen on `$relay` and fork one child per accepted connection.
+     * Listen on the relay and fork a child for each accepted connection.
      *
-     * `$handler` is the same callable [`Worker::run`] takes, so nothing has to be adapted: the
-     * handler a `worker` backend runs unchanged is the handler this serves.
+     * The handler matches {@see Worker::run()}. `$children` limits concurrent
+     * children; zero means unlimited. Do not set it below the server's worker
+     * count, or some startup connections will remain unaccepted.
      *
-     * `$children` caps how many children may run at once, not a queue depth. `0` — the default —
-     * means **no cap**, which is what an `attach` deployment wants: volucer dials the relay exactly
-     * `workers` times at startup and holds one connection per slot, so the live children are
-     * already bounded by that number. A cap is only useful to reserve memory for *other* processes
-     * on the host, and a cap **below** `workers` is not a queue — it is a startup failure, because
-     * the surplus dials sit unaccepted in the listen backlog while the pool waits for a handshake
-     * no child is there to send.
-     *
-     * Each child serves exactly one connection and exits, which is what makes recycling cheap and
-     * the assignment exact: volucer closes a slot, the child sees end-of-file and exits, and this
-     * loop forks a replacement for the next connection.
-     *
-     * The master runs until it is asked to stop. `SIGTERM`/`SIGINT` stop it accepting, close the
-     * listener, remove the socket file, and wait briefly for the children already serving — the
-     * graceful half of what a service manager expects.
-     *
-     * `$relay` may be `null`, in which case [`Supervisor::relay`] reads `VOLUCER_RELAY_SOCKET`. That
-     * is the form a deployment should use: the server reads the same variable for its `relay`, so
-     * the address is written once instead of in two files that nothing keeps in sync. A value
-     * passed here still wins, so a script that names its own socket keeps meaning what it says.
+     * A null relay uses `VOLUCER_RELAY_SOCKET`. SIGTERM and SIGINT stop accepting
+     * connections and give active children a bounded time to finish.
      */
     public static function serve(?string $relay, callable $handler, int $children = 0): void
     {
@@ -277,8 +170,7 @@ final class Supervisor
             ));
         }
 
-        // Warned rather than refused: the hazard shows up as a stalled pool under load, and
-        // taking a serving deployment down for it would be the worse answer. See the method.
+        // Warn rather than abort; callers can enforce a hard failure if needed.
         $hazard = self::grpcForkHazard();
         if ($hazard !== null) {
             @fwrite(STDERR, '[volucer] warning: ' . $hazard . "\n");
@@ -287,12 +179,7 @@ final class Supervisor
         $limit = $children > 0 ? $children : null;
         $listener = self::listen($relay);
 
-        // The SDK is loaded *before* the first fork, and that is load-bearing rather than tidy.
-        // The autoloader is lazy, so a class the master has not touched is compiled by the first
-        // child that needs it — and a `require` that fatals in a child after the master has already
-        // said "listening" shows up as a connection reset on the pool's first request rather than
-        // as the error it is. It is also half the memory argument: a class table the master has
-        // loaded is inherited.
+        // Load SDK classes before forking so children inherit the initialized class table.
         self::warm();
 
         $stopping = false;
@@ -310,8 +197,7 @@ final class Supervisor
                 self::reap($live);
 
                 if ($limit !== null && count($live) >= $limit) {
-                    // Every slot is busy. Waiting rather than accepting keeps the assignment exact:
-                    // a connection taken now would sit in a child that has no slot to serve.
+                    // Wait for a child slot before accepting another connection.
                     usleep(self::SLOT_BACKOFF_US);
 
                     continue;
@@ -319,27 +205,21 @@ final class Supervisor
 
                 $connection = @stream_socket_accept($listener, self::ACCEPT_TIMEOUT);
                 if ($connection === false) {
-                    // A timeout, or a signal that interrupted the accept — expected once per
-                    // exiting child. Either way the loop goes back to waiting, and the reap at the
-                    // top of the next iteration collects the child that caused it.
+                    // Retry after timeout or signal; the next iteration reaps exited children.
                     continue;
                 }
 
                 $pid = pcntl_fork();
 
                 if ($pid === -1) {
-                    // Out of processes. Dropping the connection is the honest answer: volucer sees
-                    // a closed socket on that slot and replaces it on the next request, where
-                    // pretending to have forked would leave a slot waiting for an answer that never
-                    // comes.
+                    // Close the connection so the server can replace this worker slot.
                     fclose($connection);
 
                     continue;
                 }
 
                 if ($pid !== 0) {
-                    // The master must drop its copy, or the socket never reaches end-of-file when
-                    // the child exits and one fd leaks per connection.
+                    // Close the master's copy so the child can signal EOF on exit.
                     fclose($connection);
                     $live[$pid] = true;
 
@@ -350,9 +230,7 @@ final class Supervisor
 
                 fclose($listener);
 
-                // The master's signal handling is meaningless here: a handler inherited by a child
-                // would swallow the `SIGTERM` a service manager sends to the whole group and leave
-                // this process serving a connection nobody is waiting for.
+                // Restore default signal handling so service-manager signals stop the child.
                 self::restoreSignals();
 
                 self::serveOne($connection, $handler);
@@ -370,16 +248,9 @@ final class Supervisor
     }
 
     /**
-     * Serve one connection in a forked child, then exit.
+     * Serve one connection in a child and exit.
      *
-     * The connection is already open, so this is [`Worker::create`] and not [`Worker::connect`] —
-     * the whole of what `attach` asks of the SDK.
-     *
-     * `exit` rather than a normal return, and that is deliberate twice over: normal shutdown would
-     * run the master's shutdown functions once per child, and it would flush any output buffer the
-     * application left open, so every child would write the master's bytes again — the classic
-     * duplicated-output bug of a forked server. The buffers are discarded here for that reason,
-     * because PHP's `exit` flushes them.
+     * Discard inherited output buffers to avoid flushing the master's output.
      *
      * @param resource $connection
      */
@@ -394,8 +265,7 @@ final class Supervisor
         } catch (\Throwable $error) {
             $code = 1;
 
-            // stderr, never stdout: the child inherited the supervisor's, which is where a service
-            // manager collects it. `Worker` already sends PHP's own warnings there.
+            // Keep diagnostics off stdout, which carries protocol frames.
             @fwrite(STDERR, sprintf(
                 "[volucer] worker exited: %s: %s\n",
                 $error::class,
@@ -413,15 +283,7 @@ final class Supervisor
     }
 
     /**
-     * Reap every child that has exited, dropping it from `$live`.
-     *
-     * A child that exits stays a zombie until its parent waits for it, so a supervisor that only
-     * accepts and forks grows one per connection — measured at exactly 10 zombies for 10
-     * connections. `WNOHANG` in a loop is what keeps this from blocking in the middle of the accept
-     * loop. Deliberately not a `SIGCHLD` handler, which the reference supervisor in
-     * `volucer-competition` uses: a handler reaps behind this loop's back, so the live count would
-     * never fall and a capped supervisor would stop accepting after `children` connections. One
-     * reaper, one place.
+     * Reap exited children without blocking and remove them from `$live`.
      *
      * @param array<int, true> $live
      */
@@ -440,10 +302,7 @@ final class Supervisor
     }
 
     /**
-     * Give the children already serving a bounded chance to finish.
-     *
-     * Bounded because a child may be mid-request and the service manager will escalate anyway; an
-     * unbounded wait would turn a shutdown into a hang.
+     * Give active children a bounded time to finish during shutdown.
      *
      * @param array<int, true> $live
      */
@@ -460,13 +319,7 @@ final class Supervisor
         }
     }
 
-    /**
-     * Install the shutdown handler.
-     *
-     * Only a flag is set: the accept loop owns the teardown, because closing the listener from a
-     * signal handler that may have interrupted `accept` on that same listener is a race worth not
-     * having.
-     */
+    /** Install signal handlers that ask the accept loop to stop. */
     private static function installSignals(callable $stop): void
     {
         pcntl_async_signals(true);
@@ -486,12 +339,7 @@ final class Supervisor
         }
     }
 
-    /**
-     * The one readiness line a deployment needs.
-     *
-     * A unit file or a container healthcheck can wait for this line rather than guessing, and it is
-     * on stderr because stdout belongs to whatever the application might print.
-     */
+    /** Print readiness to stderr, leaving stdout available for protocol output. */
     private static function announce(string $relay, ?int $children): void
     {
         @fwrite(STDERR, sprintf(
@@ -501,12 +349,7 @@ final class Supervisor
         ));
     }
 
-    /**
-     * Refuse on a build that cannot fork, naming the platform's own alternative.
-     *
-     * Checked before the listener is created, so a refusal leaves no socket file behind for the
-     * next attempt to trip over.
-     */
+    /** Require the pcntl functions needed to fork and manage children. */
     private static function requireFork(): void
     {
         foreach (['pcntl_fork', 'pcntl_waitpid', 'pcntl_signal', 'pcntl_async_signals'] as $function) {
@@ -524,18 +367,10 @@ final class Supervisor
     }
 
     /**
-     * The reason a forking PHP will stall, if one applies here, or `null`.
+     * Describe the gRPC fork hazard, or return null when it does not apply.
      *
-     * `grpc` starts an executor, a resolver and a timer thread when its module initialises, and a
-     * `fork()` after that inherits locks no surviving thread will release. The child deadlocks in
-     * `exit()` — inside grpc's module shutdown — and stays in state `S`, so `SIGCHLD` never fires
-     * and the master never reaps it. Measured: nine stuck children after eight recycles with the
-     * hazard present, none with `GRPC_ENABLE_FORK_SUPPORT=1` in the environment.
-     *
-     * `serve()` calls this and warns on stderr rather than throwing, because the failure is a
-     * stall under load rather than a broken start-up: refusing to start would take a working
-     * deployment down on a warning. It is public so a caller can turn it into a hard failure
-     * where a stalled pool is worse than no server.
+     * When the extension is loaded, `GRPC_ENABLE_FORK_SUPPORT=1` must be set
+     * before PHP starts; setting it from PHP is too late.
      */
     public static function grpcForkHazard(): ?string
     {
@@ -543,9 +378,7 @@ final class Supervisor
             return null;
         }
 
-        // grpc's own opt-in for a process that forks. It has to be an environment variable: the
-        // `grpc.enable_fork_support` ini setting is read after the threads already exist, so an
-        // `-d` flag reports the requested value and changes nothing.
+        // The extension reads this environment setting before its threads start.
         $enabled = getenv('GRPC_ENABLE_FORK_SUPPORT');
         if ($enabled !== false && $enabled !== '' && $enabled !== '0') {
             return null;

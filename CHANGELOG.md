@@ -7,6 +7,31 @@ All notable changes to `sailantis/volucer-worker` are recorded here. The format 
 Versions are also tagged in git, and `composer require` resolves to the highest tag — so a fix
 listed here as unreleased is not installed by anyone until the tag exists.
 
+## [Unreleased]
+
+### Added
+
+- **`Worker::withoutCgiGlobals()`** opts out of installing CGI superglobals. They remain enabled
+  by default; the `Request` API works either way.
+- **`Request::input()`** provides the `$_REQUEST` merge, with form fields taking precedence over
+  query parameters.
+- **CGI-compatible request globals.** Populate `$_REQUEST`, and provide `SCRIPT_NAME`, `PHP_SELF`
+  and `DOCUMENT_ROOT` in `$_SERVER`.
+
+### Fixed
+
+- **CGI globals and form parsing.** Populate `$_SERVER` on every HTTP request and parse
+  `application/x-www-form-urlencoded` bodies into `$_POST` for `POST` requests, including when a
+  charset parameter is present. gRPC calls do not receive CGI globals.
+- **Handlers that call `exit`.** Send the captured response before the worker is replaced.
+  Because PHP's shutdown handler cannot recover the exit code or headers, the response uses status
+  `200` and `app_status` `0`; output from later shutdown handlers is discarded.
+
+### Changed
+
+- **Request handling avoids duplicate work.** Build each request once, cache derived request data,
+  streamline header mapping, and register the shutdown handler only once per process.
+
 ## [0.3.0] - 2026-11-04
 
 Installed by `composer require` from this tag. A deployment still on `0.2.0` has the two

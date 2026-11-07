@@ -4,17 +4,21 @@ declare(strict_types=1);
 
 namespace Volucer;
 
-/**
- * A request as the server sent it.
- *
- * Deliberately a plain value object rather than PSR-7: the SDK is a transport,
- * not a framework, so it must not force a dependency on anyone's interfaces. An
- * application that wants PSR-7 builds one from this in a few lines (see
- * the worker protocol specification in `sailantis/volucer` and
- * example/worker.php).
- */
+/** A request received from the server, represented as a dependency-free value object. */
 final class Request
 {
+    /** @var array<string, string>|null Cached CGI-style server variables. */
+    private ?array $serverVarsCache = null;
+
+    /** @var array<string, mixed>|null */
+    private ?array $queryCache = null;
+
+    /** @var array<string, mixed>|null */
+    private ?array $inputCache = null;
+
+    /** @var bool|null */
+    private ?bool $grpcCache = null;
+
     /**
      * @param array<string, string> $headers header names as received, deduplicated by exact name
      * @param array<string, string> $server CGI-style server variables
@@ -31,12 +35,9 @@ final class Request
         public readonly array $server = [],
         public readonly array $post = [],
         public readonly array $files = [],
-    ) {
-    }
+    ) {}
 
-    /**
-     * Look up a header case-insensitively, the way HTTP requires.
-     */
+    /** Look up a header case-insensitively. */
     public function header(string $name): ?string
     {
         foreach ($this->headers as $key => $value) {
@@ -54,27 +55,36 @@ final class Request
     }
 
     /**
-     * The parsed form fields, as a SAPI would put in `$_POST`.
+     * Return parsed form fields for multipart or URL-encoded POST requests.
      *
-     * Populated only for the two media types a SAPI parses:
-     * `application/x-www-form-urlencoded` and `multipart/form-data`. Empty for anything else,
-     * which is the same answer a `php-cgi` deployment gives — an application that wants JSON
-     * reads {@see Request::$body}.
+     * Other body types are available through {@see Request::$body}.
      *
      * @return array<string, mixed>
      */
     public function post(): array
     {
-        return $this->post;
+        if ($this->post !== []) {
+            return $this->post;
+        }
+
+        if (strcasecmp($this->method, 'POST') !== 0 || $this->body === '') {
+            return [];
+        }
+
+        if (!$this->hasMediaType('application/x-www-form-urlencoded')) {
+            return [];
+        }
+
+        $params = [];
+        parse_str($this->body, $params);
+
+        return $params;
     }
 
     /**
-     * The uploaded files, as a SAPI would put in `$_FILES` — including its transposed shape.
+     * Return uploaded files in the shape used by `$_FILES`.
      *
-     * Read this rather than re-parsing {@see Request::$body}: the parser already streamed each
-     * file to disk, so the bodies are not held in memory. `$request->body` still carries the raw
-     * multipart bytes, because PHP's own `php://input` being empty for multipart is a quirk
-     * worth being a superset of rather than copying.
+     * Files are already streamed to disk; the raw multipart body remains available separately.
      *
      * @return array<string, mixed>
      */
@@ -84,57 +94,36 @@ final class Request
     }
 
     /**
-     * Whether this request is a gRPC call.
+     * Whether the content type identifies a gRPC request.
      *
-     * By `content-type`, which is the only thing that says so — deliberately not by the *shape* of
-     * the path. An HTTP route can be spelled `/a.B/M`, and treating one as a method call because it
-     * looks like one is how a route becomes a service without anyone deciding that. The server makes
-     * the same distinction from the same header, and the two must not differ.
-     *
-     * The suffix rule is the server's: `application/grpc` followed by the end of the value, `;`, `+`
-     * or `-`. A bare prefix test would accept `application/grpcx`, which is a *different* media type
-     * that happens to begin with the same letters.
+     * Accepts `application/grpc` followed by end-of-value, `;`, `+`, or `-`.
      */
     public function isGrpc(): bool
     {
+        // Cache the media-type test used by the request dispatcher.
+        if ($this->grpcCache !== null) {
+            return $this->grpcCache;
+        }
+
         $type = strtolower(trim($this->contentType() ?? ''));
         if (!str_starts_with($type, 'application/grpc')) {
-            return false;
+            return $this->grpcCache = false;
         }
 
         $rest = substr($type, strlen('application/grpc'));
 
-        return $rest === '' || $rest[0] === ';' || $rest[0] === '+' || $rest[0] === '-';
+        return $this->grpcCache = ($rest === '' || $rest[0] === ';' || $rest[0] === '+' || $rest[0] === '-');
     }
 
     /**
-     * The service and method this call addresses, or null when the path is not a method path.
-     *
-     * A single implementation of gRPC's routing rule, and the client's own. gRPC addresses a service by
-     * `:path`: `/pkg.Service/Method`, exactly two segments, both protobuf names. Anything else — a
-     * third segment, an empty part, a query string — is `null` rather than a lenient guess, because
-     * what a wrong answer does is hand an application an arbitrary URL as a method name.
-     *
-     * The server checks the *same* rule before it delivers a call, so a handler that reaches this and
-     * gets `null` is being handed something the server would have refused — which cannot happen through
-     * a listener, and is worth knowing when this is called on a `Request` built by hand in a test.
+     * Return the gRPC service and method from `/service/method`, or null if invalid.
      *
      * @return array{0: string, 1: string}|null `[service, method]`
      */
     public function grpcMethod(): ?array
     {
-        // **No `parse_url` here**, and that is the whole of this method's first line.
-        //
-        // `parse_url('/a.B/M?x=1', PHP_URL_PATH)` answers `/a.B/M` — it *strips* the query. The server
-        // does not, because gRPC addresses a method by `:path` alone, so the `?` is simply not a byte a
-        // protobuf identifier may contain and the call is refused. Using `parse_url` would therefore
-        // make this client and that server disagree about the same `:path`: the server would refuse a
-        // call this worker would have served, and the disagreement would be invisible. (This was found
-        // by exactly that test — `src/Request.php` and `crates/volucer-core`'s `parse_grpc_path` now
-        // state the same rule, and each says so.)
-        //
-        // What `parse_url` *is* needed for is the absolute form: `http://host/a.B/M` is a request line a
-        // proxy could send, and its path is the part after the authority.
+        // Validate the raw path so query text cannot be stripped from an invalid method path.
+        // Parse only absolute-form request targets to extract their path.
         $path = $this->uri;
         if (str_contains($path, '://')) {
             $path = parse_url($path, PHP_URL_PATH);
@@ -143,14 +132,14 @@ final class Request
             return null;
         }
 
-        $rest = substr($path, 1);
+        $rest  = substr($path, 1);
         $slash = strpos($rest, '/');
         if ($slash === false) {
             return null;
         }
 
         $service = substr($rest, 0, $slash);
-        $method = substr($rest, $slash + 1);
+        $method  = substr($rest, $slash + 1);
         if (str_contains($method, '/') || $method === '') {
             return null;
         }
@@ -161,29 +150,19 @@ final class Request
         return [$service, $method];
     }
 
-    /**
-     * The service this call addresses, or null when the path is not a method path.
-     */
+    /** Return the gRPC service name, or null if the path is invalid. */
     public function grpcService(): ?string
     {
         return $this->grpcMethod()[0] ?? null;
     }
 
-    /**
-     * The method this call addresses, or null when the path is not a method path.
-     */
+    /** Return the gRPC method name, or null if the path is invalid. */
     public function grpcCalledMethod(): ?string
     {
         return $this->grpcMethod()[1] ?? null;
     }
 
-    /**
-     * Whether a name is a protobuf full name: identifiers joined by dots.
-     *
-     * One function for both parts, as in the server, so that the rule a *service* name is checked
-     * against and the rule a configuration's `grpc_services` entry is checked against cannot drift.
-     * Case-sensitive, because protobuf identifiers are: `a.B` and `a.b` are two different services.
-     */
+    /** Whether a dot-separated name contains valid, case-sensitive protobuf identifiers. */
     private static function isProtoName(string $name): bool
     {
         if ($name === '') {
@@ -200,56 +179,66 @@ final class Request
     }
 
     /**
-     * The value for $_SERVER, built the way the CGI environment would.
+     * Build CGI-style server variables from request metadata.
      *
-     * Not a full CGI environment: the server passes only what the protocol
-     * carries and the SDK derives the conventional names from it.
+     * `SCRIPT_NAME` and `PHP_SELF` use the request path; `DOCUMENT_ROOT` is
+     * derived from `scriptFilename`. Explicit server values override derived ones.
      *
      * @return array<string, string>
      */
     public function serverVars(): array
     {
+        if ($this->serverVarsCache !== null) {
+            return $this->serverVarsCache;
+        }
+
         $server = [
-            'REQUEST_METHOD' => $this->method,
-            'REQUEST_URI' => $this->uri,
+            'REQUEST_METHOD'  => $this->method,
+            'REQUEST_URI'     => $this->uri,
             'SERVER_PROTOCOL' => $this->protocol,
-            'REMOTE_ADDR' => $this->remoteAddr,
+            'REMOTE_ADDR'     => $this->remoteAddr,
             'SCRIPT_FILENAME' => $this->scriptFilename,
-            'HTTPS' => $this->https ? 'on' : '',
-            'CONTENT_LENGTH' => (string) strlen($this->body),
+            'HTTPS'           => $this->https ? 'on' : '',
+            'CONTENT_LENGTH'  => (string) strlen($this->body),
         ];
 
-        $path = parse_url($this->uri, PHP_URL_PATH);
+        $path  = parse_url($this->uri, PHP_URL_PATH);
         $query = parse_url($this->uri, PHP_URL_QUERY);
-        if (is_string($path)) {
-            $server['PATH_INFO'] = $path;
+        if (is_string($path) && $path !== '') {
+            // These variables describe the request path, not the front controller.
+            $server['PATH_INFO']   = $path;
+            $server['SCRIPT_NAME'] = $path;
+            $server['PHP_SELF']    = $path;
         }
         if (is_string($query)) {
             $server['QUERY_STRING'] = $query;
         }
 
+        if ($this->scriptFilename !== '') {
+            $directory = str_replace('\\', '/', dirname($this->scriptFilename));
+            if ($directory !== '.' && $directory !== '') {
+                $server['DOCUMENT_ROOT'] = $directory;
+            }
+        }
+
         foreach ($this->headers as $name => $value) {
-            // Content-Type and Content-Length are the two headers CGI gives
-            // unprefixed names. This matches the server exactly: it builds the
-            // same array for `php-cgi`, and its own test asserts that
-            // HTTP_CONTENT_TYPE is never sent. Emitting HTTP_CONTENT_TYPE here
-            // instead would leave CONTENT_TYPE absent, and any framework asking
-            // for the content type would see none.
-            if (strcasecmp($name, 'content-length') === 0) {
+            // Convert header names to CGI's uppercase, underscore form.
+            $key = 'HTTP_' . strtr($name, self::HEADER_NAME_FROM, self::HEADER_NAME_TO);
+
+            // CGI exposes these two headers without the HTTP_ prefix.
+            if ($key === 'HTTP_CONTENT_LENGTH') {
                 // The framed body length is authoritative, as in the server.
                 continue;
             }
-            if (strcasecmp($name, 'content-type') === 0) {
+            if ($key === 'HTTP_CONTENT_TYPE') {
                 $server['CONTENT_TYPE'] = $value;
                 continue;
             }
-            $key = 'HTTP_' . strtoupper(strtr($name, '-', '_'));
+
             $server[$key] = $value;
         }
 
-        // A body with no declared type has no CONTENT_TYPE at all, which PHP
-        // treats as form-urlencoded. The server fills this in too, so a worker
-        // sees the same environment a `php-cgi` backend would have seen.
+        // Match PHP's default form content type when a non-empty body has no type.
         if ($this->body !== '' && !isset($server['CONTENT_TYPE'])) {
             $server['CONTENT_TYPE'] = 'application/x-www-form-urlencoded';
         }
@@ -258,35 +247,62 @@ final class Request
             $server[$key] = $value;
         }
 
-        return $server;
+        return $this->serverVarsCache = $server;
     }
 
-    /**
-     * The query string parsed the way PHP populates $_GET.
-     *
-     * @return array<string, mixed>
-     */
+    /** The `strtr` pair that upper-cases an ASCII header name and turns `-` into `_`. */
+    private const HEADER_NAME_FROM = 'abcdefghijklmnopqrstuvwxyz-';
+    private const HEADER_NAME_TO = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ_';
+
+    /** Return query parameters parsed like PHP's `$_GET`. @return array<string, mixed> */
     public function query(): array
-    {        $query = parse_url($this->uri, PHP_URL_QUERY);
+    {
+        if ($this->queryCache !== null) {
+            return $this->queryCache;
+        }
+
+        $query = parse_url($this->uri, PHP_URL_QUERY);
         if (!is_string($query) || $query === '') {
-            return [];
+            return $this->queryCache = [];
         }
 
         $params = [];
         parse_str($query, $params);
 
-        return $params;
+        return $this->queryCache = $params;
     }
 
     /**
-     * The cookies parsed the way PHP populates $_COOKIE.
-     *
-     * Nothing else fills $_COOKIE in a worker, so an application that reads it
-     * — or that wants the session id PHP would have found in it — has to be
-     * given the mapping explicitly.
-     *
-     * @return array<string, string>
+     * Whether the request's `Content-Type` names this media type, ignoring any parameters.
      */
+    private function hasMediaType(string $mediaType): bool
+    {
+        $header = $this->contentType();
+        if ($header === null) {
+            return false;
+        }
+
+        $semicolon = strpos($header, ';');
+
+        return strcasecmp(trim($semicolon === false ? $header : substr($header, 0, $semicolon)), $mediaType) === 0;
+    }
+
+    /**
+     * Merge POST and query parameters like PHP's default `request_order=GP`.
+     *
+     * POST values take precedence; cookies are not included.
+     *
+     * @return array<string, mixed>
+     */
+    public function input(): array
+    {
+        if ($this->inputCache === null) {
+            $this->inputCache = $this->post() + $this->query();
+        }
+        return $this->inputCache;
+    }
+
+    /** Return cookies parsed from the request header. @return array<string, string> */
     public function cookies(): array
     {
         $header = $this->header('cookie');

@@ -358,15 +358,16 @@ Assert::true(
     'the two uploads got distinct temp files, so neither overwrote the other',
 );
 
-// ---------------------------------------------------------------- what is deliberately not populated
+// ---------------------------------------------------------------- what is populated, and what is not
 
-$notPopulated = null;
+$populated = null;
 
 run_upload_worker(
-    a_upload(a_form_with_one_file()),
-    static function (Request $request) use (&$notPopulated): Response {
-        $notPopulated = [
+    a_upload(a_form_with_one_file(), 1, 37, [], 'POST', '/upload?title=from-query&page=2'),
+    static function (Request $request) use (&$populated): Response {
+        $populated = [
             'request' => $_REQUEST,
+            'server' => $_SERVER,
             'session_is_array' => isset($_SESSION) && is_array($_SESSION),
         ];
 
@@ -374,10 +375,32 @@ run_upload_worker(
     },
 );
 
+// `$_REQUEST` merges the form fields over the query string, which is what `php-cgi` does with
+// the default `request_order = "GP"` — measured, not assumed: a posted `title` overrides the
+// query's, and a key only the query has survives.
 Assert::same(
-    [],
-    $notPopulated['request'],
-    '$_REQUEST is left empty rather than guessed from a request_order the SDK cannot know',
+    ['title' => 'A title', 'page' => '2'],
+    $populated['request'],
+    '$_REQUEST is the form fields merged over the query string, POST last so it wins',
+);
+
+Assert::same(
+    'POST',
+    $populated['server']['REQUEST_METHOD'] ?? null,
+    '$_SERVER is populated for every HTTP request, not only a multipart one',
+);
+
+Assert::same(
+    '/upload?title=from-query&page=2',
+    $populated['server']['REQUEST_URI'] ?? null,
+    '$_SERVER carries REQUEST_URI, the full request target including the query, as CGI does',
+);
+
+Assert::same(
+    '/upload',
+    $populated['server']['SCRIPT_NAME'] ?? null,
+    'SCRIPT_NAME is the request path, not the front controller: php-cgi is handed the controller '
+    . 'for every path, so deriving this from script_filename would report /index.php for /wp-admin/',
 );
 
 // ---------------------------------------------------------------- the helpers

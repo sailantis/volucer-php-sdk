@@ -5,29 +5,11 @@ declare(strict_types=1);
 namespace Volucer;
 
 /**
- * Key-value storage, as the server holds it.
+ * Client for a configured key-value storage.
  *
- * One instance per storage, obtained from {@see Worker::kv()} or {@see Rpc::kv()}. The shape is
- * PSR-16's, because that is what an application already knows and what every other cache in PHP-land
- * speaks — but this is not a PSR-16 *implementation* and does not pretend to be one. The differences
- * are deliberate and each is worth knowing:
- *
- * - **No `getMultiple` key-returning form.** PSR-16's `getMultiple` returns an array keyed by the keys
- *   it found, which loses the distinction between a key that is absent and one whose value is `null`
- *   — and this wire format can carry both, so the distinction is preserved and the methods say so.
- * - **Values are serialized here, on the client.** That is the point of the whole design: the server
- *   holds opaque bytes and never sees your objects, so `encrypt()` below can do what it likes and the
- *   server cannot tell the difference. RoadRunner's KV serializes on the server and therefore cannot
- *   offer that.
- * - **No `setMultiple` with a per-item TTL**, because PSR-16 does not have one either and the server
- *   would have to invent a shape for it.
- *
- * ## The methods that can fail, and how
- *
- * A store that cannot serve a call raises {@see ProtocolException}, and the *value* methods return
- * `null` for a key that is absent. Those are different things and are kept different on purpose: an
- * application that treated a failed cache as a miss would silently re-fetch everything, and one that
- * treated a miss as a failure would break whenever the cache was cold.
+ * Provides PSR-16-style operations, but is not a PSR-16 implementation. Values
+ * are serialized client-side, and presence can be distinguished from a stored
+ * null. Call failures raise {@see ProtocolException}; cache misses do not.
  */
 final class Kv
 {
@@ -38,16 +20,7 @@ final class Kv
     private string $storage;
 
     /**
-     * How a value is turned into bytes and back.
-     *
-     * Defaults to `json_encode`/`json_decode` with `true` for associative arrays, which is what an
-     * application expects when it caches an array. **Replace it** with `serialize`/`unserialize` to
-     * store objects, or with an encrypting pair — both work because the server never looks.
-     *
-     * A callable pair rather than a class name, so that a closure capturing a key can be used without
-     * a wrapper class existing. The decode side is given the bytes and must return the value; a
-     * throw from it propagates as the caller's, since the server cannot be blamed for a value *this*
-     * client wrote in a format *this* client cannot read.
+     * Value encoder. Defaults to JSON; custom encoders can serialize or encrypt values.
      *
      * @var callable(mixed): string
      */
@@ -75,19 +48,14 @@ final class Kv
         $this->decode = $decode ?? static fn (string $bytes): mixed => json_decode($bytes, true, 512, JSON_THROW_ON_ERROR);
     }
 
-    /**
-     * The storage's name, as configured.
-     */
+    /** Return the configured storage name. */
     public function storage(): string
     {
         return $this->storage;
     }
 
     /**
-     * Replace how values are serialized.
-     *
-     * The pair must be inverse. A mismatch is not detectable here — the server cannot tell, which is
-     * the point — and it shows up as a value that decodes to something else or throws.
+     * Replace the value encoder and decoder; the pair must be compatible.
      *
      * @param callable(mixed): string $encode
      * @param callable(string): mixed $decode
@@ -101,13 +69,9 @@ final class Kv
     }
 
     /**
-     * Fetch a value, or `null` if there is none.
+     * Fetch a value, setting `$found` to distinguish a miss from stored null.
      *
-     * The second return value — reached through the `$found` reference — is what PSR-16 cannot express
-     * and a cache with nullable values needs: `['name' => null]` is a stored value, and so is a key
-     * nobody has ever written. Without it, an application caching a `null` would re-fetch it for ever.
-     *
-     * @param bool|null $found set to whether the key was present, whatever the value.
+     * @param bool|null $found whether the key was present
      */
     public function get(string $key, ?bool &$found = null): mixed
     {
@@ -122,21 +86,11 @@ final class Kv
         return ($this->decode)(self::unbase64($value));
     }
 
-    /**
-     * Store a value.
-     *
-     * `$ttl` is in seconds. `null` means no expiry, and **`0` means delete**, which is PSR-16's rule and
-     * the server enforces it: a caller passing zero expecting an immediate expiry would otherwise get a
-     * key that never goes away.
-     */
+    /** Store a value; TTL is in seconds, null means no expiry, and non-positive values delete. */
     public function set(string $key, mixed $value, ?int $ttl = null): bool
     {
         if ($ttl !== null && $ttl <= 0) {
-            // PSR-16's rule — "a negative or zero TTL MUST cause the item to be deleted" — applied here
-            // rather than sent, because the wire carries an unsigned count of seconds and a negative one
-            // has no representation in it. A client that passed `-1` expecting a delete gets one; a
-            // client that passed it expecting a very long expiry has made a mistake this cannot guess at,
-            // and deleting is the reading that cannot lose data.
+            // PSR-16 treats non-positive TTLs as deletion; the wire only accepts unsigned TTLs.
             return $this->delete($key);
         }
 
@@ -154,22 +108,9 @@ final class Kv
     }
 
     /**
-     * Store a value **only if the key is not already there**, answering whether it was stored.
+     * Atomically store a value only if the key is absent.
      *
-     * This is the primitive a lock cannot be. A TTL lock has no fencing token, so a worker that stalls
-     * past its deadline can be inside a section somebody else has entered — the server says so at
-     * [Worker::lock](../README.md) and in its own documentation. Where a real invariant is at stake, the
-     * storage decides instead: `true` means this call's value is the one under the key, `false` means
-     * somebody else's already was, and **`false` is a success** — a caller that treats it as a failure
-     * retries a write that was correctly refused.
-     *
-     * The atomicity is the driver's: `SET NX` on Redis, a shard lock in memory, `O_CREAT|O_EXCL` on the
-     * file driver. A check-then-act on the client side would not be — that is why the server grew the
-     * method rather than leaving it to be composed out of `has` and `set`.
-     *
-     * `$ttl` is in seconds and behaves as it does on [set], except that `0` is **refused by the server**
-     * rather than treated as a delete: a conditional write that immediately deletes is a no-op nobody
-     * asked for.
+     * False means the key already exists. TTL must be positive or null.
      */
     public function setIfAbsent(string $key, mixed $value, ?int $ttl = null): bool
     {
@@ -193,9 +134,7 @@ final class Kv
         return ($answer['stored'] ?? false) === true;
     }
 
-    /**
-     * Whether a key is stored, without reading it.
-     */
+    /** Whether a key exists, without fetching its value. */
     public function has(string $key): bool
     {
         $answer = $this->ask($this->method('has'), ['key' => self::key($key)]);
@@ -203,9 +142,7 @@ final class Kv
         return ($answer['present'] ?? false) === true;
     }
 
-    /**
-     * Remove a key, answering whether it was there.
-     */
+    /** Remove a key and report whether it existed. */
     public function delete(string $key): bool
     {
         $answer = $this->ask($this->method('delete'), ['key' => self::key($key)]);
@@ -213,30 +150,17 @@ final class Kv
         return ($answer['deleted'] ?? false) === true;
     }
 
-    /**
-     * How long a key has left.
-     *
-     * Returns `'missing'` or `'forever'` — two strings, not two numbers — or an `int` of seconds. A
-     * three-state answer because two states have no remaining time and only one of them has a value
-     * behind it; `getTtl` in PSR-16 returns `null` for both, which is a distinction an application
-     * counting its own misses needs.
-     */
+    /** Return remaining seconds, or `missing`/`forever`. */
     public function ttl(string $key): int|string
     {
         $answer = $this->ask($this->method('ttl'), ['key' => self::key($key)]);
         $ttl = $answer['ttl'] ?? 'missing';
 
-        // A float is not returned by the server, but a JSON number that happens to be whole decodes as
-        // one on some platforms, so it is normalised here rather than documented as a requirement.
+        // Normalize JSON numeric values to an integer.
         return is_string($ttl) ? $ttl : (int) $ttl;
     }
 
-    /**
-     * Remove every key in **this** storage.
-     *
-     * Not `flush`: a deployment with two storages must not have one call empty both. The server's own
-     * note says the same thing.
-     */
+    /** Remove every key in this storage. */
     public function clear(): bool
     {
         $answer = $this->ask($this->method('clear'));
@@ -245,14 +169,10 @@ final class Kv
     }
 
     /**
-     * Fetch several keys at once.
-     *
-     * The answer is keyed by the keys that were *found*, and `$missing` receives the ones that were not.
-     * PSR-16's shape — an array keyed by key, absent keys simply missing — cannot express a stored
-     * `null`, and this can, so the two are separated rather than merged.
+     * Fetch multiple keys, returning found values and listing misses separately.
      *
      * @param list<string> $keys
-     * @param list<string>|null $missing set to the keys that had no value.
+     * @param list<string>|null $missing keys with no value
      * @return array<string, mixed>
      */
     public function getMultiple(array $keys, ?array &$missing = null): array
@@ -277,7 +197,7 @@ final class Kv
     }
 
     /**
-     * Store several values at once, all with the same TTL.
+     * Store multiple values with the same TTL.
      *
      * @param array<string, mixed> $values
      */
@@ -298,10 +218,7 @@ final class Kv
     }
 
     /**
-     * Fetch a number of keys that were set together, or `null` for any that are absent.
-     *
-     * A convenience over {@see Kv::getMultiple} that keeps the *positions*, which is what a caller
-     * iterating one list of keys wants.
+     * Fetch multiple values in input order; missing keys are null.
      *
      * @param list<string> $keys
      * @return list<mixed>
@@ -323,23 +240,11 @@ final class Kv
     }
 
     /**
-     * Make a call, and turn a refusal into an exception rather than a result.
-     *
-     * **The distinction this exists for is the one an application is least able to notice.** A refused
-     * call — an ungranted storage, a malformed key, a store that is full — leaves `Worker::call` returning
-     * `null` with the reason recorded in `lastCallError`. Read without this check, that `null` is
-     * indistinguishable from "this key is not cached", so an application whose cache was never granted
-     * would re-derive everything on every request and look perfectly healthy doing it. That is exactly the
-     * failure a cache is deployed to prevent, arriving without a log line.
-     *
-     * A call that failed is therefore an exception here, and one the caller may catch. There is no
-     * "return a default" mode: a caller that wants to treat a cache failure as a miss can catch this and
-     * say so, which is a decision it has made rather than one it has inherited.
+     * Make a call, raising on failure so it cannot be mistaken for a cache miss.
      *
      * @param array<string, mixed> $params
      * @return array<string, mixed>
-     *
-     * @throws ProtocolException if the server refused the call.
+     * @throws ProtocolException if the call failed.
      */
     private function ask(string $name, array $params = []): array
     {
@@ -347,11 +252,7 @@ final class Kv
 
         $error = $this->calls->lastCallError();
         if ($error !== null) {
-            // `"%s failed"` rather than `"the server refused %s"`, and the difference is one a
-            // worker's channel could not produce: over `[rpc]`, a call can fail *before it is sent* —
-            // a deployment that granted this backend no `services` hands it no address at all — and
-            // an operator reading "the server refused" would go looking at the server's log for a
-            // request it never received. The reason string says which case it was.
+            // A call can fail before reaching the server, so do not imply it was refused there.
             throw new ProtocolException(sprintf(
                 '%s failed: %s%s',
                 $name,
@@ -365,25 +266,13 @@ final class Kv
         return is_array($answer) ? $answer : [];
     }
 
-    /**
-     * The method name the server routes on: `kv.<storage>.<verb>`.
-     *
-     * The storage is part of the method rather than a parameter, because the server's namespace is `kv`
-     * and the whole string after it selects the store — so a typo in the storage is a refusal naming the
-     * storages this worker may reach, rather than a call that reaches the wrong one.
-     */
+    /** Build the routed method name, `kv.<storage>.<verb>`. */
     private function method(string $verb): string
     {
         return "kv.{$this->storage}.{$verb}";
     }
 
-    /**
-     * A key, base64-encoded.
-     *
-     * Encoding the key rather than sending it as text is the same decision as for values: a key is an
-     * opaque string to the server, and an application that hashes or encrypts its keys would otherwise
-     * have bytes above `0x7f` that JSON cannot carry.
-     */
+    /** Validate and base64-encode an opaque key. */
     private static function key(string $key): string
     {
         if ($key === '') {

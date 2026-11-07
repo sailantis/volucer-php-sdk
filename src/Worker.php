@@ -5,50 +5,10 @@ declare(strict_types=1);
 namespace Volucer;
 
 /**
- * A persistent worker: the loop that serves requests over the protocol.
+ * Persistent worker for the Volucer protocol.
  *
- * This is the PHP end of the worker protocol specified in the volucer server
- * (`sailantis/volucer`, `docs/worker-protocol.md`). The shape an application sees
- * is deliberately three lines:
- *
- * ```php
- * $worker = Worker::connect();
- * $worker->run(function (Request $request, Worker $worker): Response {
- *     return Response::text('hello ' . $request->uri);
- * });
- * ```
- *
- * ## The two rules
- *
- * The protocol document names two rules that prevent the classic bugs, and both
- * are enforced here rather than merely documented:
- *
- * ### 1. stdout is the protocol channel
- *
- * Every frame this class writes goes to a handle on `php://stdout`. If the
- * application wrote there too — via `echo`, a warning, a notice — its output
- * would land *inside* a frame and desynchronise the stream for good.
- *
- * So the application's own output is not banned, it is **captured**:
- * `ob_start()` around each request collects `echo` and template output, and
- * [`ini_set`]`('display_errors', 'stderr')` in [`Worker::create`] sends
- * warnings and notices to stderr, which is not part of the protocol. Captured
- * output becomes the response body when the handler does not supply one, which
- * makes this a feature as much as a safeguard: an application that just echoes
- * works unchanged.
- *
- * The residual risk is a write made directly to the `STDOUT` handle
- * (`fwrite(STDOUT, …)`, `file_put_contents('php://stdout', …)`), which no
- * output buffer can intercept. That is not how PHP or any framework produces
- * output, and the consequence is a checksum mismatch that the server reports
- * clearly rather than a silent corruption — see [`Header`].
- *
- * ### 2. Graceful shutdown by construction
- *
- * When the server stops the worker it closes the child's stdin. This loop reads
- * that as EOF and returns from `run()`, so the worker exits on its own. There is
- * no signal to catch and no flag to poll, which is why the server only needs to
- * kill the process after a grace period rather than to ask nicely twice.
+ * Protocol frames use stdout; application output is captured and errors go to stderr.
+ * The worker exits gracefully when the server closes stdin.
  */
 final class Worker implements CallPlane
 {
@@ -68,26 +28,10 @@ final class Worker implements CallPlane
     public const PACKAGE = 'sailantis/volucer-worker';
 
     /**
-     * The build of this SDK: the version its checkout is at, the commit it is
-     * on, or both — whatever the surrounding install advertises.
+     * Return this SDK's installed version and commit reference, or `unknown`.
      *
-     * Deliberately *not* a version constant. During development there is no
-     * release to name — `main` is the artifact — and a literal would be one more
-     * thing to keep true by hand each time anything changed. Asking the install
-     * answers the question that actually matters ("which exact build is this
-     * worker running?") and cannot go stale, because nothing is written down to
-     * go stale.
-     *
-     * `Composer\InstalledVersions` is an optional dependency and a static array
-     * lookup, not a subprocess: null for a worker started by a bare
-     * `php worker.php`, which never went through Composer. It is also null for a
-     * path repository, which carries no version of its own — so the commit
-     * reference is the part that survives in a development checkout, and is the
-     * part that identifies the build.
-     *
-     * `'unknown'` is the honest answer when neither is available. It is not a
-     * failure: a worker that cannot say which build it is can still serve
-     * requests, and it should not refuse to start over a diagnostic.
+     * Values come from Composer when available, so development checkouts are
+     * identified without maintaining a version constant.
      */
     public static function build(): string
     {
@@ -115,16 +59,7 @@ final class Worker implements CallPlane
     }
 
     /**
-     * What Composer knows about *this* package, or nulls when it is not installed.
-     *
-     * Asked by name rather than through `getRootPackage()`, because the root
-     * package is the **consuming application**: using it would make the SDK
-     * report its host's build under the worker's own name, which is a plausible
-     * looking answer and the wrong one.
-     *
-     * Everything is guarded because this must never throw. A worker started by a
-     * bare `php worker.php` has no Composer at all, and a diagnostic is not worth
-     * a failed handshake.
+     * Return this package's Composer version and reference, or nulls if unavailable.
      *
      * @return array{0: ?string, 1: ?string} version, then commit reference
      */
@@ -192,9 +127,35 @@ final class Worker implements CallPlane
     /** Whether this request had its CGI superglobals installed, and so must clear them. */
     private bool $installingGlobals = false;
 
+    /** Whether CGI superglobals are installed for HTTP requests (enabled by default). */
+    private bool $cgiGlobals = true;
+
+    /** Whether the current request still needs a response from the shutdown handler. */
+    private bool $requestUnanswered = false;
+
+    /** Whether the process-wide shutdown responder has been registered. */
+    private bool $shutdownResponderRegistered = false;
+
     /** The output-buffer nesting depth we found when the capture started. */
     private int $captureLevel = 0;
 
+    /**
+     * Disable CGI superglobal installation for applications that use {@see Request} instead.
+     *
+     * The default is enabled for compatibility with conventional PHP applications.
+     */
+    public function withoutCgiGlobals(): static
+    {
+        $this->cgiGlobals = false;
+
+        return $this;
+    }
+
+    /** Whether the CGI superglobals are installed. See {@see Worker::withoutCgiGlobals()}. */
+    public function installsCgiGlobals(): bool
+    {
+        return $this->cgiGlobals;
+    }
     private bool $keepAlive = true;
 
     private bool $stopping = false;
@@ -290,6 +251,9 @@ final class Worker implements CallPlane
         $this->in = $in;
         $this->out = $out;
         $this->err = $err;
+
+        // Register early so framework shutdown output is captured before the response is finalized.
+        $this->registerShutdownResponder();
     }
 
     /**
@@ -352,43 +316,13 @@ final class Worker implements CallPlane
      */
     private const CONNECT_TIMEOUT = 10.0;
 
-    /**
-     * Whether Nagle's algorithm is disabled on the socket transport.
-     *
-     * **On, and it is not a micro-optimisation.** The protocol is a strict request/response
-     * ping-pong of small frames, and [`Worker::send`] writes a frame as a header write
-     * followed by a payload write. Without `TCP_NODELAY` the second write is held until the
-     * first is acknowledged, and the peer's acknowledgement is delayed by up to 40 ms — so
-     * every single request paid that timer, in both directions.
-     *
-     * Measured on loopback, same process, concurrency 1: **38.96 ms per request with Nagle
-     * on against 0.06 ms with it off**, over a protocol-shaped ping-pong. On the whole
-     * `/items` route that turned a 2,334 rps arm into a 24 rps one — a 100x difference that
-     * looked like a design flaw in the socket transport and was this one option.
-     *
-     * The server has always set it on its own side (`set_nodelay(true)` in
-     * `volucer-server`'s handshake); only the worker half was missing, so the option has to
-     * be here for the two halves to mean the same thing.
-     */
+    /** Disable Nagle's algorithm for the small request/response frames. */
     private const TCP_NODELAY = true;
 
     /**
-     * Create a worker bound to whichever transport the server asked for.
+     * Connect using the configured socket, or use stdio when none is configured.
      *
-     * This is what a worker file should call. With `VOLUCER_WORKER_SOCKET` set, the
-     * protocol runs over a loopback socket; with it unset, over stdin/stdout exactly as
-     * [`Worker::create`] does. Nothing else in a worker needs to know which one it got.
-     *
-     * The option exists for one measured reason. On Windows, PHP's stream layer takes ~8 ms
-     * median (15 ms at p95) to return from a blocking read on a *pipe*, while the same read
-     * on a *socket* returns in ~0.09 ms. A Rust process reading the identical pipe returns
-     * in 0.010 ms, so the cost is PHP-on-Windows rather than the pipe. See the `transport`
-     * setting in the volucer configuration, and plan hazard 46.
-     *
-     * A worker that cannot reach the address exits non-zero rather than falling back to
-     * stdio. Falling back would be worse than failing: the server is waiting for a
-     * connection, so a worker that quietly reads stdin instead would present as a startup
-     * timeout with no clue as to the cause.
+     * A failed socket connection exits with an error; it never silently falls back to stdio.
      */
     public static function connect(): self
     {
@@ -400,13 +334,8 @@ final class Worker implements CallPlane
 
         $unix = self::unixPath($address);
 
-        // The wrapper, not an `if` around two calls: `unix://` and `tcp://` differ in the
-        // URL and in whether a context means anything, so building the pair once is what
-        // keeps a unix socket from silently receiving `tcp_nodelay`, which is `ENOPROTOOPT`
-        // on an `AF_UNIX` socket and is only ignored because the return value is not checked.
-        //
-        // `@` because the warning duplicates the message below, which is also written to
-        // stderr — and on the socket transport stderr is the only channel the server sees.
+        // Suppress the stream warning because the failure is reported below; TCP options
+        // are only applied to TCP transports.
         $stream = @stream_socket_client(
             $unix === null ? 'tcp://' . $address : 'unix://' . $unix,
             $errno,
@@ -428,18 +357,7 @@ final class Worker implements CallPlane
         return self::create($stream, $stream);
     }
 
-    /**
-     * The filesystem path of a `unix:` address, or `null` for a TCP one.
-     *
-     * The `unix:` prefix is volucer's own convention, and it appears in three other places
-     * already — `external`'s `socket`, `attach`'s `relay` and the worker `socket` key — so
-     * reading it here is the same rule rather than a fourth spelling. A loopback TCP address
-     * is `host:port` and has no prefix, which is why the absence of one is the whole test.
-     *
-     * Split out so the decision is testable without a socket, for the same reason
-     * [`Worker::socketAddress`] is: the interesting cases are about the *string*, and a test
-     * that needs a live listener can only cover one of them.
-     */
+    /** Return the path for a `unix:` address, or null for TCP. */
     public static function unixPath(string $address): ?string
     {
         if (!str_starts_with($address, self::UNIX_PREFIX)) {
@@ -450,21 +368,7 @@ final class Worker implements CallPlane
     }
 
     /**
-     * The stream context the socket transport connects with.
-     *
-     * A separate method so the one option that matters is testable without a server, and so
-     * that extending it later — a `bindto`, a timeout — has an obvious place to go rather
-     * than being appended at a call site.
-     *
-     * `tcp_nodelay` is a *context* option rather than a call after connecting because PHP
-     * has no portable post-connect equivalent: `socket_import_stream` needs `ext-sockets`,
-     * which this package deliberately does not require. The context form is honoured by the
-     * `tcp://` wrapper and issues `setsockopt(SOL_TCP, TCP_NODELAY, 1)` during the connect —
-     * verified with `strace` on Linux, where the call appears once per connection.
-     *
-     * A context that cannot be created is not fatal: `stream_context_create` only fails on
-     * a malformed options array, which would be a bug in this method rather than a runtime
-     * condition, and `null` is a valid third argument that means "default context".
+     * Create the TCP socket context.
      *
      * @return null|resource
      */
@@ -477,15 +381,7 @@ final class Worker implements CallPlane
         return $context === false ? null : $context;
     }
 
-    /**
-     * The address the server asked to be reached at, or `null` for stdio.
-     *
-     * Split out from [`Worker::connect`] so the decision is testable without a socket: the
-     * interesting cases are all *absence* — unset, set to an empty string, set to a string
-     * of whitespace — and each of them must mean stdio rather than "connect to nowhere".
-     * An empty value is what a shell produces for `VOLUCER_WORKER_SOCKET=`, which is a
-     * thing an operator will type while debugging.
-     */
+    /** Return the configured socket address, or null when stdio should be used. */
     public static function socketAddress(): ?string
     {
         $address = getenv(self::SOCKET_ENV);
@@ -503,16 +399,10 @@ final class Worker implements CallPlane
     }
 
     /**
-     * Handshake, then serve requests until the server closes stdin.
+     * Serve requests until the server closes stdin.
      *
-     * `$handler` receives the [`Request`] and this worker, and may return:
-     *
-     * - a [`Response`] — sent as given;
-     * - a `string` — sent as a 200 `text/html` body;
-     * - `null` — the captured output becomes the body (the `echo` case).
-     *
-     * Returning null is what makes a plain PHP script work as a worker: whatever
-     * it echoed is the response.
+     * The handler may return a {@see Response}, a string body, or null to use
+     * captured output as the response body.
      *
      * @param callable(Request, self): (Response|string|null) $handler
      */
@@ -578,45 +468,10 @@ final class Worker implements CallPlane
     }
 
     /**
-     * Handshake, then handle jobs until the server closes stdin.
+     * Handle jobs until the server closes the connection.
      *
-     * The consumer side, and the shape an application sees is one line:
-     *
-     * ```php
-     * $worker = Worker::connect();
-     * $worker->consume(function (Job $job, Worker $worker): string|null {
-     *     return null;   // done; `fail($reason)` or `requeue()` to say otherwise
-     * });
-     * ```
-     *
-     * ## What the handler returns
-     *
-     * - `null` — **acknowledge.** The job is handled; the server removes the reservation.
-     * - a `string` — **reject**, with that string as the reason. The job is *acknowledged*, not
-     *   requeued, because a job an application has decided against is not a job that is waiting.
-     * - `false` — **requeue.** Not handled, and it should be handed out again.
-     *
-     * A `bool false` rather than a `Job::requeue()` method, because a handler that *throws* has also
-     * not handled the job and the two must not be confused: a throw means the application has a bug, a
-     * `false` means this job should be tried again. The second is a decision and the first is not.
-     *
-     * ## A throwing handler requeues, and that is the safe direction
-     *
-     * A consumer that crashes must not lose the job, and an application that wanted a crashing job
-     * *dropped* can catch its own exception and return a string — which is the visible, deliberate act
-     * this default pushes an application towards. The opposite default (acknowledge, so a poison job
-     * cannot loop for ever) is what RoadRunner's `fail()` without `requeue` does, and it silently
-     * discards work when a database is briefly unreachable; the loop it guards against is bounded by
-     * the `attempts` header the server puts on every job, which the application can read and act on.
-     *
-     * ## No response body, but output is still captured
-     *
-     * `run()` captures the application's `echo` because it becomes a response body. A job has no
-     * response body — so an application's `echo` is a *diagnostic*, and this captures it and forwards it
-     * through `emitLog` rather than leaving it on the protocol channel. That is rule 1 of this protocol
-     * and it applies here exactly as it does to a request worker: an unbuffered write to stdout lands
-     * inside a frame and desynchronises the stream for good. What differs is only where the captured
-     * bytes end up — in a `LOG` frame, which the server renders to its own error log.
+     * Return null to acknowledge, false to requeue, or a string to reject.
+     * Exceptions are logged and requeue the job; handler output is sent as a log.
      *
      * @param callable(Job, self): (string|false|null) $handler
      */
@@ -658,14 +513,7 @@ final class Worker implements CallPlane
                     break;
 
                 case MessageType::REQUEST:
-                    // The mirror of the `JOB` arm in `run()`: a request on a consumer has nowhere to go.
-                    // Answered with an `ERROR` rather than only diagnosed, and that is not politeness:
-                    // the server's request path has a 30-second deadline and its answer to a missed one
-                    // is to kill the worker. A silent consumer would therefore turn a one-line
-                    // configuration mistake into a worker killed once a minute, with nothing in the log
-                    // saying why. A non-recoverable `ERROR` is reported as a protocol failure *without*
-                    // discarding the worker, which is the honest outcome: the stream is aligned, the
-                    // deployment is wrong.
+                    // Report the mode mismatch so the server can fail the request without a timeout.
                     $this->diagnose(
                         'the server sent a REQUEST to a worker that consumes jobs; this worker is '
                         . 'configured for the wrong mode'
@@ -685,12 +533,7 @@ final class Worker implements CallPlane
         }
     }
 
-    /**
-     * Read one job, call the handler, and answer with what it decided.
-     *
-     * The whole outcome policy is the match at the bottom, and it is deliberately the only place it
-     * exists on this side — see [`Worker::consume`] for why each arm is what it is.
-     */
+    /** Read a job, invoke its handler, and send the resulting acknowledgement. */
     private function handleJob(Header $header, string $payload): void
     {
         $this->requestId = $header->requestId;
@@ -710,11 +553,7 @@ final class Worker implements CallPlane
 
         $started = hrtime(true);
 
-        // **Captured, and then written to stderr — not left to reach stdout.** A job has no response
-        // body, so echoing is a diagnostic rather than a result, and an application's `echo` on an
-        // unbuffered write to the protocol channel would land *inside* a frame and corrupt the stream
-        // for good. That is rule 1 of this protocol, and it applies to a consumer exactly as it does to
-        // a request worker: what differs is only where the captured bytes go.
+        // Jobs have no response body, so captured application output is logged.
         $this->beginCapture();
         try {
             /** @var mixed $result */
@@ -735,8 +574,7 @@ final class Worker implements CallPlane
                 $exception->getLine(),
             ));
 
-            // Requeued, not acknowledged: a consumer that crashed must not lose the job. See
-            // `consume` for why this is the safe direction and what bounds the loop.
+            // Preserve the job when its handler fails.
             $outcome = 'requeue';
             $reason = $exception->getMessage();
         } finally {
@@ -763,19 +601,7 @@ final class Worker implements CallPlane
         }
     }
 
-    /**
-     * Tell the server a job cannot be run, without running it.
-     *
-     * A worker handed a `JOB` it has no handler for — a request worker the deployment pointed at a
-     * queue — must still answer it, because a dropped job leaves the server's poller waiting until the
-     * exchange's deadline and a deadline is a kill. Rejected rather than requeued: the configuration is
-     * wrong, and handing the same job to the same misconfigured worker again is a loop rather than a
-     * retry.
-     *
-     * The body is read and discarded rather than ignored, and that is not tidiness: the frames are
-     * already on the wire, and a reader that stopped after the head would read the job's payload as the
-     * next frame header.
-     */
+    /** Reject a job when this worker has no consumer handler. */
     private function refuseJob(Header $header, string $payload): void
     {
         $metadata = $this->decodeJson($payload, 'a JOB header');
@@ -790,14 +616,7 @@ final class Worker implements CallPlane
         ]);
     }
 
-    /**
-     * Serve one request: read its body, call the handler, write the response.
-     *
-     * **One method for both protocols**, because one worker answers both. The HTTP handler is the field
-     * `run()` set, the gRPC handler is the field `onGrpc()` set, and which one a request reaches is
-     * decided by its content type — see [`Worker::onGrpc`] for why that, rather than how the process was
-     * started, is the right question to ask.
-     */
+    /** Serve one HTTP or gRPC request, selected by its content type. */
     private function serve(Header $header, string $payload): void
     {
         $this->requestId = $header->requestId;
@@ -825,29 +644,25 @@ final class Worker implements CallPlane
         }
 
         $started = hrtime(true);
-        // Capture is started before either arm and is *discarded* by the gRPC one: `echo` cannot become a
-        // gRPC message, because the reply is a framed message in a trailer-carrying body. Starting it
-        // here rather than inside the HTTP arm means the `$request` both arms see is built in the same
-        // protected scope, with one place that opens it.
+        // Capture HTTP output; gRPC output is discarded rather than treated as a message.
         $this->beginCapture();
 
-        // **Installed before the handler and cleared in a `finally`.** A worker process serves
-        // many requests, so a superglobal left populated is the next request's user seeing this
-        // one's upload — the highest-severity failure this path can have. The reset covers every
-        // exit: a normal return, a throw, and the streamed-response early return below.
-        //
-        // Only for an HTTP request. A gRPC call is not a form submission, and filling `$_POST`
-        // from its length-delimited body would be inventing data.
+        // Install globals for HTTP requests and clear them in finally to prevent state leaking.
         $this->currentPost = $multipart?->post() ?? [];
         $this->currentFiles = $multipart?->files() ?? [];
-        $this->installingGlobals = $multipart !== null && !$this->looksLikeGrpc($metadata);
+
+        // Share one request instance between globals and the handler.
+        $request = $this->buildRequest($metadata, $body);
+
+        $this->installingGlobals = $this->cgiGlobals && !$request->isGrpc();
         if ($this->installingGlobals) {
-            Globals::install($this->buildRequest($metadata, $body), $this->currentPost, $this->currentFiles);
+            Globals::install($request, $this->currentPost, $this->currentFiles);
         }
 
-        try {
-            $request = $this->buildRequest($metadata, $body);
+        // The shutdown responder handles requests that end with exit before respond() is reached.
+        $this->requestUnanswered = true;
 
+        try {
             if ($request->isGrpc()) {
                 $response = $this->answerGrpc($request, $started);
             } else {
@@ -860,9 +675,7 @@ final class Worker implements CallPlane
                 }
                 $result = $handler($request, $this);
                 $captured = $this->endCapture();
-                // **A streamed response leaves here, and does not come back.** Its head goes out
-                // before its body exists, so it cannot be normalised into a `Response` and answered
-                // by `respond()` below — that method's whole contract is that the body is complete.
+                // Streamed responses send their head before the body is available.
                 if ($result instanceof StreamedResponse) {
                     $this->respondStreamed($result, 0, (int) ((hrtime(true) - $started) / 1000));
                     return;
@@ -871,8 +684,7 @@ final class Worker implements CallPlane
             }
             $appStatus = 0;
         } catch (\Throwable $exception) {
-            // The handler left its buffer open or unwound ours, so recover
-            // whatever is there before reporting the failure.
+            // Recover any captured output before reporting the failure.
             $this->endCapture();
 
             $this->diagnose(sprintf(
@@ -883,14 +695,7 @@ final class Worker implements CallPlane
                 $exception->getLine(),
             ));
 
-            // A gRPC failure has to be reported the way gRPC reports one, and this is the SDK's half of
-            // that: an HTTP error status is unreadable to a gRPC client, which reads the outcome from
-            // the trailer section. So a broken handler on a call becomes `INTERNAL` in the trailers
-            // rather than a 500 the client cannot interpret. The diagnostic above still says what
-            // actually happened, which the status cannot.
-            //
-            // `isGrpc()` is re-derived rather than remembered, because the failure may have happened
-            // while *building* the request — before there is a variable holding it.
+            // gRPC clients read errors from trailers; the request may not have been built yet.
             $response = $this->looksLikeGrpc($metadata)
                 ? $this->grpcResponse(
                     GrpcResponse::fail(GrpcResponse::INTERNAL, 'the application failed while serving this call'),
@@ -899,10 +704,7 @@ final class Worker implements CallPlane
                 : Response::text("Internal Server Error\n", 500);
             $appStatus = 1;
         } finally {
-            // Runs on every path, including the streamed early return, and after the handler's
-            // response has been written. Order matters: the globals are cleared *before* the
-            // temp files are removed, so a handler that stored a `tmp_name` in a database and
-            // reads it on the next request gets a missing file rather than another user's.
+            // Clear request globals before removing uploaded files.
             if ($this->installingGlobals) {
                 Globals::reset();
                 $this->installingGlobals = false;
@@ -928,10 +730,7 @@ final class Worker implements CallPlane
     {
         $handler = $this->grpcHandler;
         if ($handler === null) {
-            // Not an error, and not a 500: a call that arrived at a worker with no gRPC handler is
-            // exactly what gRPC's `UNIMPLEMENTED` means, and the client is entitled to treat it as
-            // final rather than to retry it. The capture started by `serve` covers the request that was
-            // just read and is discarded here.
+            // An unregistered gRPC method is a normal UNIMPLEMENTED response.
             $this->endCapture();
 
             return $this->grpcResponse(
@@ -946,9 +745,7 @@ final class Worker implements CallPlane
         try {
             $answer = $handler($request, $this);
         } catch (\Throwable $exception) {
-            // A thrown handler is a bug in the application, and gRPC has a code for exactly that. The
-            // exception is *reported* rather than swallowed: it is the only record of what went wrong,
-            // and `INTERNAL` says nothing about it.
+            // Log the exception and return the gRPC INTERNAL status.
             $this->diagnose(sprintf(
                 'uncaught %s while serving %s: %s in %s:%d',
                 $exception::class,
@@ -1001,25 +798,15 @@ final class Worker implements CallPlane
     }
 
     /**
-     * Write a response: head, body chunks, then the terminal status.
+     * Write the response head, body frames, and terminal status.
      *
-     * Private on purpose. The protocol puts `body_len` in the RESPONSE head, so
-     * a response has to be complete before it starts — there is no way to stream
-     * one. That makes "return a response" the only sane shape for a handler, and
-     * a public `respond()` would only offer a way to send two of them. A second
-     * head is a protocol error the server reports, so the footgun is removed
-     * rather than documented.
-     *
-     * `body_len` is declared here and every byte is then sent, because the
-     * server treats it as authoritative *and* requires the final body frame to
-     * carry LAST. Declaring a length the body does not match is exactly the bug
-     * those two checks exist to catch.
-     *
-     * The reported figure is cleared afterwards, so that each `END` describes one
-     * request. See [`peakMemoryBytes`] for why that matters.
+     * The body length is declared before sending and must match the frames.
      */
     private function respond(Response $response, int $appStatus, int $durationUs): void
     {
+        // The shutdown responder must not send a second response after this point.
+        $this->requestUnanswered = false;
+
         $body = $response->body;
 
         $this->sendJson(MessageType::RESPONSE, $this->requestId, [
@@ -1054,39 +841,17 @@ final class Worker implements CallPlane
     }
 
     /**
-     * Write a streamed response: head, chunks as they are produced, then the terminal status.
+     * Stream a response, marking only the final non-empty chunk with `FLAG_LAST`.
      *
-     * # The one rule this has to keep
-     *
-     * **Exactly one `BODY` frame carries `FLAG_LAST`, and it is the last one.** `LAST` is the only
-     * end signal a `STREAMED` head leaves — there is no declared length to check against — so a body
-     * that ends without it is reported by the server as a truncated response. That is why this
-     * cannot simply loop over the generator and write a trailing empty `LAST` frame afterwards on
-     * the happy path: an empty chunk never reaches the wire, so the flag has to be attached to the
-     * last *non-empty* chunk, which is only known once the iteration has finished.
-     *
-     * # Why the chunk is held back
-     *
-     * Holding one chunk means the first byte of the body is delayed by one iteration. That is the
-     * price of never writing a zero-length `BODY` frame, which some front-ends treat as a framing
-     * error, and of never writing `LAST` early, which would tell the server the body was complete
-     * while the generator was still running. A generator that yields exactly one chunk therefore
-     * sends it only after the generator returns — one iteration, not the whole body.
-     *
-     * # Why an exception mid-stream is not a `500`
-     *
-     * The head is already on the wire with a `200`. Reporting the failure as a status would mean two
-     * statuses for one response, so the body is left unterminated instead: the connection ends
-     * without `LAST`, and the client learns the response was truncated. The diagnostic still says
-     * what happened.
+     * If iteration fails after the response head is sent, leave the body unterminated so
+     * the server reports truncation; a second status cannot be sent.
      */
     private function respondStreamed(StreamedResponse $response, int $appStatus, int $durationUs): void
     {
-        // **The factory runs before the head goes out, and that ordering is the whole point.**
-        // Creating a generator does not run it, so a `StreamedResponse` built from a closure has
-        // still had nothing happen at this moment — which means something that fails here is a
-        // failure with no status on the wire, and it is answerable with a `500` by the `catch` in
-        // `serve`. Anything that fails later, inside the generator, is not.
+        // Same rule as `respond()`: the reply has started, so a later `exit` owes nothing.
+        $this->requestUnanswered = false;
+
+        // Create the generator before sending the head so factory errors can become a 500.
         $chunks = $response->stream();
 
         $this->sendJson(MessageType::RESPONSE, $this->requestId, [
@@ -1122,16 +887,10 @@ final class Worker implements CallPlane
         }
 
         if ($failed) {
-            // **The chunk that was produced before the failure is still sent** — without `LAST`.
-            // Those bytes are real output, and dropping them would make a failing stream lose data
-            // it had already generated. What must not happen is `LAST` or `END`: without them the
-            // server reads the body as truncated, which is exactly what it is.
+            // Preserve yielded data, but omit LAST and END so the server detects truncation.
             if ($held !== null) {
                 $this->sendBody($held, false);
             }
-            // **No `LAST`, no `END`.** The server reads a streamed body that stops without `LAST` as
-            // a truncation, which is exactly true — and it is the only honest signal available once
-            // a `200` is already on the wire.
             $this->stopping = true;
             return;
         }
@@ -1139,8 +898,7 @@ final class Worker implements CallPlane
         if ($held !== null) {
             $this->sendBody($held, true);
         } else {
-            // A generator that produced nothing. An empty `LAST` frame is the one case where a
-            // zero-length `BODY` is correct: it is the end signal and there is no chunk to carry it.
+            // An empty stream needs an empty final frame to signal completion.
             $this->send(new Frame(MessageType::BODY, $this->requestId, '', Header::FLAG_LAST));
         }
 
@@ -1178,23 +936,10 @@ final class Worker implements CallPlane
     }
 
     /**
-     * The peak resident set reached since the last request, in bytes.
+     * Return peak memory usage since the previous request, in bytes.
      *
-     * `memory_get_peak_usage(true)` is a high-water mark that begins at process
-     * start and never falls, so a worker that peaked once — during bootstrap, or
-     * during any single large request — would report a figure above a configured
-     * `memory_limit_mb` on *every* request thereafter, and the server's threshold
-     * would recycle it after each one. Correct in the sense that the peak was
-     * real, but useless in practice: it turns a leak detector into a per-request
-     * application boot.
-     *
-     * `memory_reset_peak_usage()` re-baselines the high-water mark to the current
-     * usage, so the number in the `END` frame measures the request that just
-     * finished. The reset happens *after* the figure is read. It arrived in PHP
-     * 8.2, which is also the SDK's stated minimum, so the `function_exists` guard
-     * below is not a supported path: it exists so that running on something older
-     * degrades to a monotonic figure — the old, over-eager behaviour — instead of
-     * a fatal error on the first request.
+     * Reset the high-water mark after reading it so each END frame reports
+     * request-level usage.
      *
      * @see https://www.php.net/manual/en/function.memory-reset-peak-usage.php
      */
@@ -1226,16 +971,9 @@ final class Worker implements CallPlane
     }
 
     /**
-     * Emit a metric sample without touching stdout.
+     * Emit a metric sample.
      *
-     * **The name must be a Prometheus metric name** — `[a-zA-Z_][a-zA-Z0-9_]*` — because that is
-     * what it becomes. A dot is not allowed: it is illegal in the exposition format (Prometheus uses
-     * a dot for its own `recording.rule` vocabulary), and a name carrying one arrives, is counted as
-     * refused, and never appears — so a dot here is a sample that silently does nothing.
-     *
-     * The name also has to be declared by the deployment in `[metrics.collect]` before it is
-     * accepted. A server refuses an undeclared name on purpose, so that
-     * an application cannot widen the published set at runtime.
+     * Names must match Prometheus syntax and be listed in `[metrics.collect]`.
      */
     public function emitMetric(string $name, float $value, string $unit = ''): void
     {
@@ -1247,22 +985,10 @@ final class Worker implements CallPlane
     }
 
     /**
-     * Register what answers a `CALL` the server makes while a request is in flight.
+     * Register a handler for server-initiated calls during a request.
      *
-     * The callable receives the decoded call as an array with `name` and `params`, and may return:
-     *
-     * - a value, which becomes the `RETURN`'s result;
-     * - `['ok' => false, 'error' => 'why']`, to refuse it with a definite answer;
-     * - `['ok' => false, 'unknown' => true, 'error' => 'why']`, when the call **may have taken
-     *   effect** — a lock acquired before the reply was lost, a write sent and not acknowledged.
-     *   The server treats that differently from a refusal, because a caller that retries a refusal
-     *   is safe and a caller that retries an unknown state duplicates a side effect.
-     *
-     * A throw from the callable is caught and turned into a refused call, so a bug in an application's
-     * handler cannot kill the worker: the loop is mid-request, and a `RETURN` is still owed.
-     *
-     * Optional. Without it, a `CALL` is refused by name rather than ignored — see
-     * [`Worker::$callHandler`] for why silence is not an option.
+     * Return a value, or an `ok => false` array to refuse the call. Set
+     * `unknown => true` when it may have taken effect; thrown exceptions become refusals.
      *
      * @param callable(array<string, mixed>): mixed $handler
      */
@@ -1418,24 +1144,12 @@ final class Worker implements CallPlane
     // -------------------------------------------------------------------- calls
 
     /**
-     * Ask the server to do something, from inside a request handler.
-     *
-     * The one method that sends a frame to the server *unprompted* and then waits for its answer, and
-     * it is what the whole call plane exists for: `kv.get`, `lock.acquire`, `jobs.push`,
-     * `metrics.observe`, and the `workers.*` / `config.*` control methods.
-     *
-     * **Only callable while a request is in flight.** The answer arrives on the same channel as the
-     * response, and the server's reader for this worker is parked on `recv()` between requests — so a
-     * call made outside a handler has nobody listening for the `RETURN` and would block until the
-     * deadline. It raises rather than hanging, because a hang here is a worker killed for no visible
-     * reason.
+     * Call a server service from within a request handler.
      *
      * @param string $name   `"<namespace>.<verb>"`, e.g. `kv.get`.
      * @param array<string, mixed> $params method-specific arguments.
-     *
-     * @return mixed the call's result, or null when the server refused it; see {@see Worker::lastCallError()}.
-     *
-     * @throws ProtocolException if the stream desynchronised, or a call was made outside a request.
+     * @return mixed the result, or null on refusal; see {@see Worker::lastCallError()}.
+     * @throws ProtocolException if the stream desynchronised or no request is active.
      */
     public function call(string $name, array $params = []): mixed
     {
@@ -1498,22 +1212,9 @@ final class Worker implements CallPlane
     }
 
     /**
-     * Read frames until the answer to `$id` arrives, answering anything else that comes first.
+     * Wait for a call result while dispatching other control frames.
      *
-     * **A small dispatch loop, not a nested pump.** Between the call and its answer the server may send
-     * a `PING`, a `CONTROL`, or another `CALL` — all three are ordinary and none of them is this call's
-     * answer, so each is handled exactly as the main loop handles it and the read resumes. Nothing here
-     * re-enters the request path, which is what keeps "one request in flight" true while a call is
-     * outstanding.
-     *
-     * **Blocking, with no timeout of its own**, and that is a decision rather than an omission. The
-     * protocol guarantees that every call is answered — a refusal is a `RETURN` like any other, and the
-     * server's side of that rule is that a call it cannot serve is still answered by name. So a worker
-     * waiting here is waiting for a frame that is already on its way. A timeout would need
-     * `stream_select`, which is meaningless on a Windows pipe, and it would put the deadline in the
-     * wrong place: the server is the side that knows how long a backend may take, and the per-call
-     * deadline belongs *inside the handler* for exactly that reason. Reading
-     * as the main loop reads also means a timeout cannot leave half a frame in a buffer.
+     * The server guarantees a RETURN; call deadlines are enforced server-side.
      *
      * @return mixed
      */
@@ -1996,43 +1697,10 @@ final class Worker implements CallPlane
     }
 
     /**
-     * Register the handler for gRPC calls, then serve everything until the server closes stdin.
+     * Register a gRPC handler.
      *
-     * The other half of `run()`, and the reason it is a second method rather than a mode of the
-     * first: a gRPC call is not an HTML request that happens to have an unusual content type. Its
-     * outcome travels in the **trailer section** of the reply rather than in the HTTP status, the
-     * request body is length-delimited framed messages rather than a form, and an unhandled method is
-     * a normal answer (`UNIMPLEMENTED`) rather than an error. An application that tried to serve both
-     * with one handler would have to ask which it was on every request.
-     *
-     * **Which calls count as gRPC is decided by `content-type`, not by having called this method.** A
-     * worker that serves both HTTP routes and gRPC services — which is the ordinary shape, because one
-     * pool is one backend — has one process answering both, and so does a worker that called `run()`
-     * and then `grpc()`. What this method decides is *who answers a call*: without it, a call is
-     * answered `UNIMPLEMENTED` by the SDK. Whether a call may arrive at all is the server's decision,
-     * through `grpc_services` on the backend; a service that is not listed never reaches a worker.
-     *
-     * ```php
-     * $worker = Worker::connect();
-     * $worker->onGrpc(function (Request $request, Worker $worker): GrpcResponse {
-     *     return match ($request->grpcCalledMethod()) {
-     *         'SayHello' => GrpcResponse::message(encode_reply('hello')),
-     *         default    => GrpcResponse::fail(GrpcResponse::UNIMPLEMENTED, 'no such method'),
-     *     };
-     * });
-     * $worker->run(function (Request $request, Worker $worker): Response {
-     *     return Response::json(['route' => $request->uri]);      // the HTTP half, too
-     * });
-     * ```
-     *
-     * The handler receives the [`Request`] — so it has the method path, the metadata and the raw
-     * message bytes — and returns a [`GrpcResponse`], a `string` (bytes that are sent as-is, which is
-     * the shape a handler that only builds a message needs), or `null`, meaning an empty message.
-     *
-     * **This is *not* the direction `Worker::call()` uses.** That one is the application asking the
-     * *server* for something mid-request (`kv.get`, `lock.acquire`); this one is the server delivering
-     * a unit of work. They share the channel and nothing else, and that distinction is written down
-     * in the server's own documentation.
+     * Calls are identified by their content type. The handler may return a
+     * {@see GrpcResponse}, response bytes, or null for an empty message.
      *
      * @param callable(Request, self): (GrpcResponse|string|null) $handler
      */
@@ -2062,20 +1730,9 @@ final class Worker implements CallPlane
     }
 
     /**
-     * Turn whatever a gRPC handler returned into the [`Response`] the protocol carries.
+     * Convert a gRPC result to the protocol response.
      *
-     * The translation is one step and it is the whole of how gRPC's outcome reaches the wire: the
-     * status and the message become two *response headers*, and the server moves them into the trailer
-     * section — because the worker protocol's `RESPONSE` head has nowhere else to put them, and because
-     * the server is the side that knows gRPC's framing. Nothing else about the call is special.
-     *
-     * `Content-Type: application/grpc` is set here rather than left to the application: a gRPC client
-     * refuses a reply that does not carry it before it reads a byte of the body, so a handler that
-     * forgot would see its message rejected for a reason it could not discover from the answer.
-     *
-     * `grpc-status: 0` with no message is the success case, and the absence of a message is a `0`-length
-     * *body* rather than a `0`-length message — gRPC's own convention, and the client reads the same
-     * thing either way.
+     * The server moves `grpc-status` and `grpc-message` headers into response trailers.
      */
     private function grpcResponse(mixed $answer, int $durationUs): Response
     {
@@ -2129,6 +1786,60 @@ final class Worker implements CallPlane
     }
 
     /**
+     * Send a response from the shutdown handler when application code calls exit.
+     *
+     * A process-wide handler is registered once because PHP cannot unregister shutdown
+     * callbacks. It answers only while a request is pending; the exit code and headers
+     * are unavailable, so the fallback response is HTTP 200 with captured output.
+     */
+    private function registerShutdownResponder(): void
+    {
+        if ($this->shutdownResponderRegistered) {
+            return;
+        }
+
+        $this->shutdownResponderRegistered = true;
+
+        register_shutdown_function(function (): void {
+            // **Drain before trapping.** `ob_get_clean()` closes the *innermost* buffer, so a
+            // trap opened first would be the thing drained and the page would be left to flush
+            // into the protocol channel. Innermost first here, then reversed, because the order
+            // the buffers would have flushed in is outermost first.
+            $chunks = [];
+            while (ob_get_level() > $this->captureLevel) {
+                $drained = ob_get_clean();
+                if (is_string($drained)) {
+                    $chunks[] = $drained;
+                }
+            }
+
+            // **The trap goes on in every case.** stdout is the protocol channel, so a shutdown
+            // function the application registered — WordPress's own fatal-error handler is one —
+            // would otherwise print straight into the frame stream when the worker stops.
+            ob_start();
+            register_shutdown_function(static function (): void {
+                while (ob_get_level() > 0) {
+                    ob_end_clean();
+                }
+            });
+
+            if (!$this->requestUnanswered) {
+                // Nothing is owed: the request returned normally, or the process is stopping
+                // between requests. What was drained is not a response, so it is discarded.
+                return;
+            }
+
+            try {
+                $this->respond(Response::html(implode('', array_reverse($chunks))), 0, 0);
+            } catch (\Throwable) {
+                // The pipe is already gone, or a frame was half-written. There is no client left
+                // to tell and no process left to serve, so the diagnostic is all that is owed.
+                @fwrite($this->err, "[volucer] could not answer a request ended by exit()\n");
+            }
+        });
+    }
+
+    /**
      * Stop capturing and return what the application printed.
      *
      * Written defensively because a handler can leave buffers unbalanced. The
@@ -2157,52 +1868,10 @@ final class Worker implements CallPlane
     // ------------------------------------------------------------------- codec
 
     /**
-     * Read one frame header, or null at a clean end of stream.
+     * Read one complete frame header, or return null on clean EOF.
      *
-     * `stream_get_contents($h, 16)` is doing the work here, and that is
-     * deliberate: it blocks until it has 16 bytes or the stream ends, handling
-     * partial reads itself. Hand-rolling an `fread` loop is the bug-prone part
-     * of every pipe protocol, and this call is why the SDK does not have one.
-     *
-     * **Except that it does not block until it has 16 bytes.** It returns as soon as *anything*
-     * is available, and it returns `''` for a read that hit the stream's deadline. Measured:
-     *
-     *     peer sends 8 of 16 bytes, then stalls past the deadline
-     *         -> returns 'HHHHHHHH' (8 bytes), timed_out=true, feof=false
-     *
-     * So a header can arrive in pieces, and the loop below reassembles it. The previous version
-     * handed whatever it got straight to `Header::decode`, which throws on anything that is not
-     * exactly 16 bytes — so a **slow** server killed the worker with "a frame header is exactly
-     * 16 bytes, got 8". That is the same defect as the idle one below, reached through the loud
-     * door instead of the quiet one: a deadline is not a close, whether it lands between frames
-     * or in the middle of one.
-     *
-     * **A timed-out read is not a closed connection, and this method used to conflate them.**
-     * PHP applies `default_socket_timeout` to reads on a socket stream — 60 seconds unless the
-     * deployment says otherwise — and `stream_get_contents()` returns `''` for a read that timed
-     * out *and* for a read that hit end-of-file. Reading the first as the second is not a
-     * cosmetic mistake: `null` here means "the server is finished with me", so `run()` returns,
-     * the worker exits, and the server sees one connection close where it expected an idle
-     * worker. With a pool of N attached workers and an idle gap longer than the timeout, **all N
-     * exit at once**, and the server answers the first request after the gap with a 502 while it
-     * rebuilds them.
-     *
-     * `feof()` is what separates the two, and it is free:
-     *
-     *     deadline hit, peer still open:  read=''  timed_out=true   feof=false
-     *     peer closed while waiting:      read=''  timed_out=false  feof=true
-     *
-     * So the loop below waits out a quiet connection and returns `null` only for a real close
-     * *between* frames. `stream_get_meta_data()` is consulted as well, because `feof` is
-     * documented as "the last read hit EOF" rather than as a general predicate, and two
-     * independent readings of the same fact is the right number here.
-     *
-     * The alternative — a deployment setting `default_socket_timeout = -1` — also works. It cannot
-     * be relied on, though: a `-d` flag on the supervisor is invisible to the worker that inherits
-     * the connection, and `php-cgi`, a framework's own bootstrap or an application's `ini_set` can
-     * all put a deadline back. The deadline is a *policy* for how long a request may take, and the
-     * protocol already carries one (`request_timeout`, enforced by the server); a deadline on the
-     * idle read is a different thing and must not be able to end a worker.
+     * Reassemble partial reads and treat timeouts as idle periods, not connection closure.
+     * EOF inside a header is a protocol error.
      */
     private function readHeader(): ?Header
     {

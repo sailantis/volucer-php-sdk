@@ -5,56 +5,11 @@ declare(strict_types=1);
 namespace Volucer;
 
 /**
- * The call plane for an application that has no worker channel.
+ * RPC client for backends without a worker protocol channel.
  *
- * A [`Worker`] reaches `kv`, `lock` and `jobs` on the stream that carries its requests. A FastCGI
- * application has no such stream — it exists for the duration of one request and can only answer the
- * frame it was handed — so volucer serves the same namespaces on a socket of its own, `[rpc]`, which
- * this class dials. The names are then used exactly as a worker uses them:
- *
- * ```php
- * $rpc = Rpc::connect();
- *
- * $rpc->kv('cache')->set('greeting', 'hello');
- * $id = $rpc->lock()->acquire('pdf:create');      // same lease semantics as Worker::lock()
- * $rpc->queue('mail')->push('{"to":"a@b"}');
- * ```
- *
- * ## Nothing here is configured, and that is the point
- *
- * The address and the backend's identity are **in the request's environment**, put there by volucer
- * — `VOLUCER_RPC` and `VOLUCER_RPC_TOKEN` as CGI parameters, or `X-Volucer-Rpc` and
- * `X-Volucer-Rpc-Token` as headers for an `upstream` origin. One deployment states the address once,
- * in one file, and both sides read it; an application never has a second copy to keep in step.
- *
- * A backend whose `services` list is empty is handed neither, which is why [`Rpc::connect()`] does not
- * throw when they are missing: the application gets a plane that refuses every call with a message
- * naming the missing variable. A request that never touches a store therefore still works, and the
- * one that does gets an error pointing at the deployment rather than at this class.
- *
- * ## The wire is the worker protocol's, minus the handshake
- *
- * Same [`Header`], same [`MessageType::CALL`]/[`MessageType::RETURN`], same CRC-32C. What a worker
- * establishes once in `HELLO`/`HELLO_ACK` — version, checksum policy, process identity — would be paid
- * for on every request by a CGI process, so instead **each call carries the token**. That also means a
- * grant withdrawn by a reload takes effect on the next call rather than at the next reconnect.
- *
- * One consequence worth knowing: there is no `HELLO`, so there is no offer to skip the checksum, so
- * every frame this class writes is checksummed.
- *
- * ## The deadline is here, unlike a worker's channel
- *
- * [`Worker::call()`] blocks with no timeout of its own, because the protocol guarantees an answer and
- * a timeout there would have to be `stream_select`, which is meaningless on a Windows pipe. This
- * class is the opposite case: it reads a **socket**, so `stream_set_timeout` works, and there is
- * something to time out — a server that has stopped reading, a call whose answer was lost to a
- * network hiccup. A blocking read with no deadline in a CGI process is a request that hangs until
- * PHP's own `max_execution_time` kills it, and that failure names the wrong thing.
- *
- * The default matches `[rpc].call_timeout_seconds` in the default deployment, and **a call that
- * legitimately takes longer needs a longer deadline**: `Lock::acquire($resource, $ttl, $wait)` may
- * wait for `$wait` microseconds, so a caller asking for more than the timeout must say so —
- * `Rpc::connect(timeout: 30.0)`.
+ * Reads the endpoint and token from CGI parameters or upstream headers, then
+ * exposes the same KV, lock, and queue services as {@see Worker}. It connects
+ * on the first call; each call is checksummed and has a configurable timeout.
  */
 final class Rpc implements CallPlane
 {
@@ -73,25 +28,13 @@ final class Rpc implements CallPlane
     /** The `unix:` prefix, the same convention [`Worker::UNIX_PREFIX`] holds. */
     public const UNIX_PREFIX = 'unix:';
 
-    /**
-     * The default per-call deadline, in seconds.
-     *
-     * The same number as `[rpc].call_timeout_seconds` defaults to, so a deployment that configured
-     * nothing does not have the two ends disagreeing about how long a call may take. A deployment that
-     * raised the server's value has to raise this one too — the server's is a *write* deadline and
-     * does not govern how long a handler may run.
-     */
+    /** Default per-call deadline, matching `[rpc].call_timeout_seconds`. */
     public const DEFAULT_TIMEOUT = 10.0;
 
     /** How long to wait for the server to accept the connection. */
     private const CONNECT_TIMEOUT = 10.0;
 
-    /**
-     * The largest payload this client will read, matching `MAX_PAYLOAD_LEN` in the server.
-     *
-     * Checked against the header *before* reading, so a corrupt or hostile length cannot make this
-     * process allocate gigabytes it will never fill.
-     */
+    /** Maximum payload accepted from the server; checked before reading. */
     private const MAX_PAYLOAD_LEN = 64 * 1024 * 1024;
 
     /**
@@ -147,16 +90,9 @@ final class Rpc implements CallPlane
     }
 
     /**
-     * Dial the call plane this request was told about.
+     * Create a client using explicit values or the request environment.
      *
-     * Reads `VOLUCER_RPC`/`VOLUCER_RPC_TOKEN` from `$_SERVER`, falling back to the
-     * `HTTP_X_VOLUCER_RPC*` header form an `upstream` backend is handed. A `$token` or `$address`
-     * argument overrides the environment, which is what a test and a non-CGI caller (a CLI script, a
-     * queue consumer) need.
-     *
-     * **No I/O happens here.** A request that never touches a store should not pay a `connect`, and a
-     * server that is briefly down should not fail a request that had no intention of calling it. The
-     * first [`Rpc::call()`] connects, and every call after a broken connection reconnects.
+     * Connection is deferred until the first call; broken connections are retried.
      */
     public static function connect(
         ?string $address = null,
@@ -172,17 +108,9 @@ final class Rpc implements CallPlane
     }
 
     /**
-     * The first non-empty of a CGI parameter and a header name, or null.
+     * Resolve a non-empty CGI parameter or header, then fall back to the environment.
      *
-     * `$_SERVER` rather than `getenv()` first, because under FastCGI the value volucer injects is a
-     * CGI parameter and never reaches the process environment; `getenv()` is the fallback for a CLI
-     * script that was started with `VOLUCER_RPC=…`, which is what `volucer rpc`-style tooling and a
-     * hand-run test do.
-     *
-     * Whitespace is trimmed to nothing, the same rule [`Worker::socketAddress()`] applies to
-     * `VOLUCER_WORKER_SOCKET`: `VOLUCER_RPC=` and `VOLUCER_RPC= ` are both what a shell produces while
-     * somebody is debugging, and connecting to `tcp:// ` would be a confusing failure rather than an
-     * obvious one.
+     * Values are trimmed; blank values return null.
      */
     private static function environment(string $param, string $header): ?string
     {
@@ -203,24 +131,13 @@ final class Rpc implements CallPlane
         return null;
     }
 
-    /**
-     * The address this plane dials, or null when the deployment granted this backend nothing.
-     *
-     * For a diagnostic — "which call plane is this application talking to?" is the first question
-     * when a store works in one backend and not another. The address is in the request's environment
-     * either way, so this publishes nothing that a `var_dump($_SERVER)` would not.
-     */
+    /** Return the configured endpoint, or null if no services were granted. */
     public function address(): ?string
     {
         return $this->address;
     }
 
-    /**
-     * The filesystem path of a `unix:` address, or null for a TCP one.
-     *
-     * Delegated rather than reimplemented: the prefix is volucer's own convention and appears in four
-     * other places already, and a second spelling of it here would be a fifth thing to keep true.
-     */
+    /** Return the path of a `unix:` address, or null for TCP. */
     public static function unixPath(string $address): ?string
     {
         return Worker::unixPath($address);
@@ -228,31 +145,20 @@ final class Rpc implements CallPlane
 
     // ------------------------------------------------------------------ handles
 
-    /**
-     * A handle to one of the server's key-value storages.
-     *
-     * The same handle [`Worker::kv()`] returns, over the same store — the storage must be one this
-     * backend was granted in `services`, and a call naming another is refused by the server with the
-     * storages that *are* reachable.
-     */
+    /** Return a handle to one of the backend's configured KV storages. */
     public function kv(string $storage = 'default'): Kv
     {
         return new Kv($this, $storage);
     }
 
-    /**
-     * A handle to the server's resource locks.
-     *
-     * Read [`Lock`]'s class documentation before relying on one: the lease semantics, and the fact
-     * that a lease is not a fencing token, apply here exactly as they do to a worker.
-     */
+    /** Return a handle to the server's resource locks. */
     public function lock(): Lock
     {
         return new Lock($this);
     }
 
     /**
-     * A handle to one of the server's queues, from the producer's side.
+     * Return a producer handle for a configured queue.
      *
      * @param string $pipeline the name from the `[jobs.pipelines.<name>]` table.
      */
@@ -264,16 +170,11 @@ final class Rpc implements CallPlane
     // -------------------------------------------------------------------- calls
 
     /**
-     * Ask the server to do something.
-     *
-     * Unlike [`Worker::call()`] this is callable at any time: there is no request whose answer it
-     * could steal, because there is no request on this connection. Each call is one round trip.
+     * Call a server service.
      *
      * @param string $name `"<namespace>.<verb>"`, e.g. `kv.get`.
      * @param array<string, mixed> $params method-specific arguments.
-     *
-     * @return mixed the call's result, or null when the server refused it; see {@see Rpc::lastCallError()}.
-     *
+     * @return mixed the result, or null on refusal; see {@see Rpc::lastCallError()}.
      * @throws ProtocolException if the connection failed, timed out, or a frame arrived out of order.
      */
     public function call(string $name, array $params = []): mixed
@@ -282,20 +183,14 @@ final class Rpc implements CallPlane
         $this->lastCallUnknown = false;
 
         if (!$this->ensureStream()) {
-            // Recorded rather than thrown, so that this behaves like every other refusal: `Kv::ask()`
-            // turns it into an exception naming the store and the reason, and a caller that wants to
-            // treat a cache failure as a miss can still catch it. Nothing was sent, so the call
-            // certainly did not happen — `unknown` stays false.
+            // Nothing was sent, so this is a definite failure, not an unknown outcome.
             return null;
         }
 
         $id = $this->nextCallId();
         $call = ['name' => $name, 'params' => $params];
         if ($this->token !== '') {
-            // **Omitted rather than sent empty when there is no token.** The server tells the two
-            // apart on purpose: "carried no token" is a deployment that granted this backend nothing,
-            // and "carried a token no backend was issued" is an application reading the wrong
-            // variable. An empty string would make the second message the one an operator saw.
+            // Omit an absent token so the server can distinguish missing configuration.
             $call['token'] = $this->token;
         }
 
@@ -306,38 +201,19 @@ final class Rpc implements CallPlane
         return $this->awaitReturn($id, $name);
     }
 
-    /**
-     * Why the last {@see Rpc::call()} did not return a result, or null if it did.
-     *
-     * The same distinction [`Worker::lastCallError()`] draws: `kv.get` on a missing key returns null
-     * and *succeeded*, and a caller that could not tell the two apart would treat a cache miss as a
-     * failure.
-     */
+    /** Return the reason the last call failed, or null if it succeeded. */
     public function lastCallError(): ?string
     {
         return $this->lastCallError;
     }
 
-    /**
-     * Whether the call that failed may have taken effect.
-     *
-     * True for a connection that broke or timed out **after the call was written** — the server may
-     * have served it and lost the answer. False for a call that was never sent, which is the whole
-     * reason [`Rpc::call()`] records a missing address instead of throwing: "the deployment granted
-     * this backend nothing" is a definite non-event.
-     */
+    /** Whether the failed call may have been served before its connection failed. */
     public function lastCallWasUnknown(): bool
     {
         return $this->lastCallUnknown;
     }
 
-    /**
-     * Close the connection, if there is one.
-     *
-     * Not needed before the process exits — a CGI child's descriptors go with it — but a caller that
-     * keeps an `Rpc` in a static, or a long-running CLI script, may want the descriptor back. The next
-     * call reconnects.
-     */
+    /** Close the connection; the next call reconnects. */
     public function close(): void
     {
         if (is_resource($this->stream)) {
@@ -350,13 +226,9 @@ final class Rpc implements CallPlane
     // ----------------------------------------------------------------- transport
 
     /**
-     * Make sure there is a connection, connecting if there is not one.
+     * Ensure a connection, retrying failures when an endpoint is configured.
      *
-     * **Retried on every call rather than remembered as failed.** A failure here is the server being
-     * briefly absent — a restart, a socket not yet bound — and a plane that gave up for the life of
-     * the process would turn a two-second gap into a permanently broken application. What is *not*
-     * retried is an address the deployment never provided: there is nothing to connect to, and the
-     * message says which variable is missing.
+     * Missing configuration is reported without attempting a connection.
      */
     private function ensureStream(): bool
     {
@@ -377,16 +249,14 @@ final class Rpc implements CallPlane
 
         $unix = self::unixPath($this->address);
 
-        // `@` because the warning duplicates the message recorded below, and because a connect
-        // failure is an ordinary condition here rather than a PHP diagnostic.
+        // Report connection failures through lastCallError() instead of PHP warnings.
         $stream = @stream_socket_client(
             $unix === null ? 'tcp://' . $this->address : 'unix://' . $unix,
             $errno,
             $errstr,
             self::CONNECT_TIMEOUT,
             STREAM_CLIENT_CONNECT,
-            // A context only for TCP: `tcp_nodelay` is `ENOPROTOOPT` on an `AF_UNIX` socket, and
-            // `Worker::connect()` makes the same distinction for the same reason.
+            // TCP options do not apply to Unix sockets.
             $unix === null ? self::socketContext() : null,
         );
 
@@ -412,12 +282,7 @@ final class Rpc implements CallPlane
     }
 
     /**
-     * Disable Nagle, for the reason [`Worker`] does: the protocol is a ping-pong of small frames, and
-     * an option that turns 39 ms per request into 0.06 ms is not a micro-optimisation.
-     *
-     * A *context* option rather than a call after connecting, because PHP has no portable
-     * post-connect equivalent without `ext-sockets`, which this package deliberately does not
-     * require.
+     * Create a TCP context with Nagle disabled.
      *
      * @return null|resource
      */
@@ -464,13 +329,7 @@ final class Rpc implements CallPlane
     }
 
     /**
-     * Read frames until the answer to `$id` arrives.
-     *
-     * A loop rather than a single read, for the same reason [`Worker::awaitReturn()`] is one: a frame
-     * that is not this call's answer is possible on the wire, and treating it as a desynchronisation
-     * would turn a harmless extra frame into a broken connection. What can arrive here is narrow — the
-     * listener answers `CALL` and `PING` and refuses anything else by name — so a `RETURN` for a
-     * different id is the only case worth rejecting out loud.
+     * Read and validate the matching RETURN frame.
      *
      * @return mixed
      */
@@ -543,14 +402,7 @@ final class Rpc implements CallPlane
         return null;
     }
 
-    /**
-     * Read one frame header.
-     *
-     * A timeout here is reported as a timeout, not as a closed connection, and the distinction is the
-     * reason [`Rpc::readBytes()`] exists: `stream_get_contents()` returns `''` for both, and telling an
-     * operator "the server closed the connection" when it was merely slow sends them to the wrong
-     * process.
-     */
+    /** Read one frame header, dropping the connection if it is malformed. */
     private function readHeader(string $name): Header
     {
         $bytes = $this->readBytes(Header::HEADER_LEN, $name);
@@ -558,8 +410,7 @@ final class Rpc implements CallPlane
         try {
             return Header::decode($bytes);
         } catch (ProtocolException $exception) {
-            // The framing is gone, not merely this frame: a header that does not decode means the
-            // stream's boundaries are unknown from here on, so the connection goes with it.
+            // Framing cannot be recovered after a malformed header.
             $this->drop();
             $this->lastCallUnknown = true;
             throw new ProtocolException($this->lastCallError = sprintf(
@@ -571,15 +422,9 @@ final class Rpc implements CallPlane
     }
 
     /**
-     * Read exactly `$length` bytes, or explain why it could not.
+     * Read exactly `$length` bytes, dropping the connection on EOF or timeout.
      *
-     * `stream_get_contents($stream, $n)` blocks until it has `n` bytes, reaches EOF, or the stream's
-     * deadline expires — handling partial reads internally, which is why this class has no `fread`
-     * loop. The three outcomes are told apart by the stream's metadata afterwards.
-     *
-     * **Every failure here drops the connection**, and that is not caution. A short read leaves part
-     * of a frame consumed and discarded, so the stream's framing is gone; a caller that kept the
-     * handle would read the rest of that frame as the start of the next one.
+     * A failed read consumes part of a frame, so the connection cannot be reused.
      */
     private function readBytes(int $length, string $name): string
     {
@@ -621,13 +466,7 @@ final class Rpc implements CallPlane
         $this->close();
     }
 
-    /**
-     * The next call id, counting down from the top of the range.
-     *
-     * Counted down for the same reason [`Worker`] counts down: the server decides what a frame is by
-     * which half of the range its id falls in, so a call that looked like a request would be refused
-     * by the framing layer. The wrap is four billion calls away.
-     */
+    /** Allocate a call id from the range reserved for calls. */
     private function nextCallId(): int
     {
         $id = $this->nextCallId;

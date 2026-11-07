@@ -144,15 +144,20 @@ function json_of(array $frames, int $type): array
  *
  * @param list<array{0: int, 1: int, 2?: mixed, 3?: int}> $frames the server's frames
  * @param callable(Request, Worker): mixed $handler
+ * @param (callable(Worker): mixed)|null $configure applied before the loop starts
  * @return array{frames: list<array{header: Header, payload: string}>, raw: string, stderr: string}
  */
-function run_worker(array $frames, callable $handler): array
+function run_worker(array $frames, callable $handler, ?callable $configure = null): array
 {
     $in = server_stream($frames);
     $out = sink();
     $err = sink();
 
-    (new Worker($in, $out, $err))->run($handler);
+    $worker = new Worker($in, $out, $err);
+    if ($configure !== null) {
+        $configure($worker);
+    }
+    $worker->run($handler);
 
     $raw = drained($out);
 
@@ -465,8 +470,91 @@ Assert::true(
 );
 Assert::same(['one done', 'two'], $unbalancedBodies, 'both requests produce exactly their own bodies');
 
-// ------------------------------------------------------------- body chunking
+// ------------------------------------------ the CGI superglobals, for every request
 
+// `$_SERVER` used to be installed only for a multipart body, which left a plain GET with no
+// host and no URI — the failure a framework sees as "I do not know my own URL" rather than as
+// an error. It is now installed for every HTTP request.
+$globals = run_worker(
+    array_merge([A_HELLO], a_get('/some/path?q=1', 1)),
+    static function (Request $request): Response {
+        return Response::json([
+            'method' => $_SERVER['REQUEST_METHOD'] ?? null,
+            'uri' => $_SERVER['REQUEST_URI'] ?? null,
+            'script_name' => $_SERVER['SCRIPT_NAME'] ?? null,
+            'host' => $_SERVER['HTTP_HOST'] ?? null,
+            'query' => $_SERVER['QUERY_STRING'] ?? null,
+            'get' => $_GET,
+            'request' => $_REQUEST,
+        ]);
+    },
+);
+$seenGlobals = json_decode(payloads_of($globals['frames'], MessageType::BODY)[0], true, 512, JSON_THROW_ON_ERROR);
+
+Assert::same('GET', $seenGlobals['method'], '$_SERVER carries REQUEST_METHOD for a plain GET');
+Assert::same('/some/path?q=1', $seenGlobals['uri'], '$_SERVER carries the full request target');
+Assert::same('example.test', $seenGlobals['host'], '$_SERVER carries HTTP_HOST, derived from the Host header');
+Assert::same('q=1', $seenGlobals['query'], '$_SERVER carries QUERY_STRING');
+Assert::same(['q' => '1'], $seenGlobals['get'], '$_GET is the parsed query string, as PHP fills it');
+Assert::same(['q' => '1'], $seenGlobals['request'], '$_REQUEST is populated, so legacy routing parameters read');
+Assert::same(
+    '/some/path',
+    $seenGlobals['script_name'],
+    'SCRIPT_NAME is the request path, not the front controller the frame names',
+);
+
+// ------------------------------------------------------ the opt-out from the install
+
+// A deployment whose application reads the Request rather than a superglobal can turn the
+// install off. The Request must keep answering; only the superglobals go away.
+$optedOut = run_worker(
+    array_merge([A_HELLO], a_get('/no-globals?q=1', 1)),
+    static function (Request $request): Response {
+        return Response::json([
+            'server_is_empty' => $_SERVER === [],
+            'get_is_empty' => $_GET === [],
+            'request_still_has_query' => $request->query(),
+            'request_still_has_uri' => $request->uri,
+        ]);
+    },
+    static fn (Worker $worker) => $worker->withoutCgiGlobals(),
+);
+$optOutSeen = json_decode(payloads_of($optedOut['frames'], MessageType::BODY)[0], true, 512, JSON_THROW_ON_ERROR);
+
+Assert::true($optOutSeen['server_is_empty'], 'withoutCgiGlobals() leaves $_SERVER unpopulated');
+Assert::true($optOutSeen['get_is_empty'], 'withoutCgiGlobals() leaves $_GET unpopulated');
+Assert::same(['q' => '1'], $optOutSeen['request_still_has_query'], 'the Request still answers the query');
+Assert::same('/no-globals?q=1', $optOutSeen['request_still_has_uri'], 'the Request still carries the URI');
+
+// ---------------------------------------------------- a handler that calls exit
+
+// A worker's contract is that a handler *returns*. `exit` ends the process instead, which the
+// server reports as a 502 while replacing the worker — and `exit` is how legacy PHP ends most
+// requests. The response is recovered from a shutdown handler, so a page that was echoed is
+// still delivered and the worker is not lost.
+$exitRun = run_worker(
+    array_merge([A_HELLO], a_get('/leaves-by-exit', 1), a_get('/after', 2)),
+    static function (Request $request) {
+        if ($request->uri === '/leaves-by-exit') {
+            echo 'page produced before exit';
+
+            // `exit` in a test would end the test process, so this asserts the *contract* the
+            // shutdown handler implements rather than provoking it: see `ExitTest.php`, which
+            // runs a real subprocess for the part that cannot be faked.
+            return null;
+        }
+
+        return Response::text('after');
+    },
+);
+
+Assert::same(
+    ['page produced before exit', 'after'],
+    payloads_of($exitRun['frames'], MessageType::BODY),
+    'a handler that produces its body by echoing still yields it',
+);
+
+// ------------------------------------------------------------- body chunking
 $big = str_repeat('abcdefgh', 70000); // 560000 bytes: nine chunks of 65536
 $chunked = run_worker(array_merge([A_HELLO], a_get('/big')), static fn () => Response::text($big));
 
