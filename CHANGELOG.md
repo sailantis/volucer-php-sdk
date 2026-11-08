@@ -11,22 +11,17 @@ listed here as unreleased is not installed by anyone until the tag exists.
 
 ### Performance
 
-- **A response leaves in one write instead of three.** `respond()` sent the head, the body and the
-  terminal frame as three `fwrite` + `fflush` pairs, which is three `write()` syscalls per response
-  and three wakeups of the server's relay reader. Nothing in the protocol needs them separated: the
-  channel is half-duplex and the server reads frames until `END`, so it never waits on a worker
-  mid-response. Measured at 32 workers, warm socket transport, `/echo`: **51,492 → 56,037 rps
-  (+8.8%, 5 of 5 interleaved rounds)**; on `/items`, which is PHP-bound, **+4.5%**.
+- **Responses are coalesced into one write.** `respond()` now writes the header, body, and terminal
+  frame together, reducing three write/flush pairs to one. The half-duplex protocol reads through
+  `END`, so separate writes are unnecessary. At 32 warm socket workers, `/echo` improved from
+  **51,492 to 56,037 rps (+8.8%, 5/5 rounds)**; PHP-bound `/items` improved **4.5%**.
 
-  Bodies above `COALESCE_MAX_BODY` (1 MiB) still go out frame by frame. Coalescing them would mean
-  building the body a second time in memory — a 200 MB download would cost 200 MB of extra peak RSS
-  in every worker, which is a worse trade than the syscalls. Both paths are asserted to emit the
-  same frames.
+  Bodies over `COALESCE_MAX_BODY` (1 MiB) remain frame-by-frame to avoid an extra body-sized
+  allocation (200 MB per worker for a 200 MB response). Both paths emit identical frames.
 
-- **`Frame::crc32c` reverses its digest with `unpack('N')` instead of `strrev` + `unpack('V')`.**
-  Same value, one fewer string copy per frame — 0.18–0.37 µs per call, three or four calls per
-  request. Measured alone: **+0.9%**, which is the same order as the run-to-run noise on `/echo`,
-  so treat it as a free tidy rather than a result.
+- **`Frame::crc32c` uses `unpack('N')` instead of `strrev` + `unpack('V')`.** It returns the same
+  value with one fewer string copy: 0.18–0.37 µs saved per call, three or four calls per request.
+  The isolated **0.9%** gain is within `/echo` run-to-run noise.
 
 ## [0.4.0] - 2026-11-07
 

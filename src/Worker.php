@@ -16,13 +16,9 @@ final class Worker implements CallPlane
     public const MAX_BODY_CHUNK = 65536;
 
     /**
-     * The largest body a response writes in one piece.
-     *
-     * Below this, the head, body and terminal frame leave in a single write — which is worth ~9%
-     * at 32 workers, measured — because the alternative is three syscalls and three wakeups of the
-     * server's reader. Above it, the frames go out separately, because coalescing would mean
-     * building the whole body a second time in memory: a 200 MB download would cost 200 MB of
-     * extra peak RSS in every worker, which is a worse trade than the syscalls.
+     * Maximum response body size coalesced into one write. Larger bodies are sent frame by
+     * frame to avoid a second full-body allocation. Coalescing improved throughput by ~9%
+     * in a 32-worker benchmark.
      */
     private const COALESCE_MAX_BODY = 1048576;
 
@@ -2229,4 +2225,3 @@ final class Worker implements CallPlane
         fflush($this->err);
     }
 }
-
