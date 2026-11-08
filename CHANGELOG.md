@@ -7,21 +7,31 @@ All notable changes to `sailantis/volucer-worker` are recorded here. The format 
 Versions are also tagged in git, and `composer require` resolves to the highest tag — so a fix
 listed here as unreleased is not installed by anyone until the tag exists.
 
-## [Unreleased]
+## [0.4.1] - 2026-11-08
+
+Installed by `composer require` from this tag. A patch release: same frames, same protocol, fewer
+syscalls. No configuration changes and no API changes.
 
 ### Performance
 
-- **Responses are coalesced into one write.** `respond()` now writes the header, body, and terminal
-  frame together, reducing three write/flush pairs to one. The half-duplex protocol reads through
-  `END`, so separate writes are unnecessary. At 32 warm socket workers, `/echo` improved from
-  **51,492 to 56,037 rps (+8.8%, 5/5 rounds)**; PHP-bound `/items` improved **4.5%**.
+- **A response leaves in one write instead of three.** `respond()` wrote the head, every body frame
+  and the terminal frame as separate `fwrite` + `fflush` pairs, so a small response cost three
+  `write()` syscalls and three wakeups of the server's relay reader. Nothing in the protocol needs
+  them separated: the channel is half-duplex and the server reads frames until `END`, so it never
+  waits on the worker in the middle of a response.
 
-  Bodies over `COALESCE_MAX_BODY` (1 MiB) remain frame-by-frame to avoid an extra body-sized
-  allocation (200 MB per worker for a 200 MB response). Both paths emit identical frames.
+  Measured at 32 workers on the warm socket transport, five interleaved rounds each:
+  **`/echo` 51,492 → 56,037 rps (+8.8%, 5 of 5 rounds); `/items` 23,695 → 24,756 rps (+4.5%)**.
 
-- **`Frame::crc32c` uses `unpack('N')` instead of `strrev` + `unpack('V')`.** It returns the same
-  value with one fewer string copy: 0.18–0.37 µs saved per call, three or four calls per request.
-  The isolated **0.9%** gain is within `/echo` run-to-run noise.
+  Bodies above `COALESCE_MAX_BODY` (1 MiB) still go out frame by frame. Coalescing them would mean
+  building the body a second time in memory — a 200 MB download would cost 200 MB of extra peak RSS
+  in every worker — which is a worse trade than the syscalls. Both paths are asserted to emit the
+  same frames.
+
+- **`Frame::crc32c` reverses its digest with `unpack('N')` instead of `strrev` + `unpack('V')`.**
+  Same value, one fewer string copy per frame — 0.18–0.37 µs per call, three or four calls per
+  request. Measured alone: **+0.9%**, which is the same order as the run-to-run noise on `/echo`,
+  so treat it as a free tidy rather than a result.
 
 ## [0.4.0] - 2026-11-07
 
@@ -138,7 +148,9 @@ different thing and must not be able to end a worker.
 
 First release: the worker protocol, the request/response exchange, and the supervisor.
 
-[Unreleased]: https://github.com/sailantis/volucer-php-sdk/compare/v0.4.0...main[0.4.0]: https://github.com/sailantis/volucer-php-sdk/releases/tag/v0.4.0
+[Unreleased]: https://github.com/sailantis/volucer-php-sdk/compare/v0.4.1...main
+[0.4.1]: https://github.com/sailantis/volucer-php-sdk/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/sailantis/volucer-php-sdk/releases/tag/v0.4.0
 [0.3.0]: https://github.com/sailantis/volucer-php-sdk/releases/tag/v0.3.0
 [0.2.0]: https://github.com/sailantis/volucer-php-sdk/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/sailantis/volucer-php-sdk/releases/tag/v0.1.0
