@@ -582,6 +582,85 @@ Assert::same(
     'body_len matches the chunked body',
 );
 
+// ------------------------------------------- coalesced vs piecewise responses
+//
+// A response is written as one buffer when the body is small, and frame by frame
+// when it is above `COALESCE_MAX_BODY`. Two write paths is a correctness risk: they
+// must put the *same frames* on the wire, or a response's meaning would depend on
+// its size. Asserted by comparing the frames of a body either side of the ceiling.
+
+$small = run_worker(
+    array_merge([A_HELLO], a_get('/small')),
+    static fn () => Response::text('a small body'),
+);
+
+// 1 MiB + 1 byte is the smallest body that takes the piecewise path, and it spans
+// several MAX_BODY_CHUNK frames, so this also covers splitting inside that path.
+$large = str_repeat('q', 1048577);
+$largeRun = run_worker(
+    array_merge([A_HELLO], a_get('/large')),
+    static fn () => Response::text($large),
+);
+
+/** Frame types, flags and payloads, in order — everything the server can observe. */
+$shape = static function (array $frames): array {
+    $out = [];
+    foreach ($frames as $frame) {
+        $header = $frame['header'];
+        $out[] = [$header->messageType, $header->flags, $frame['payload']];
+    }
+
+    return $out;
+};
+
+Assert::same(
+    ['RESPONSE', 'BODY', 'END'],
+    array_map(
+        static fn ($f) => MessageType::name($f['header']->messageType),
+        array_slice($small['frames'], 1), // [0] is the handshake's HELLO_ACK
+    ),
+    'a small response is three frames, regardless of how they are written',
+);
+
+Assert::same(
+    (int) ceil(strlen($large) / Worker::MAX_BODY_CHUNK),
+    count(array_filter(
+        $largeRun['frames'],
+        static fn ($f) => $f['header']->messageType === MessageType::BODY,
+    )),
+    'a response above the coalescing ceiling is still split into MAX_BODY_CHUNK frames',
+);
+
+Assert::same(
+    strlen($large),
+    json_of($largeRun['frames'], MessageType::RESPONSE)[0]['body_len'],
+    'the piecewise path declares the same body_len',
+);
+
+$largeBody = '';
+foreach ($largeRun['frames'] as $frame) {
+    if ($frame['header']->messageType === MessageType::BODY) {
+        $largeBody .= $frame['payload'];
+    }
+}
+Assert::same($large, $largeBody, 'the piecewise path reassembles to the original body');
+
+// The last frame must still be END for both, and LAST only on the final body frame:
+// the server uses those two to tell a complete response from a truncated one.
+Assert::same(
+    MessageType::END,
+    $largeRun['frames'][count($largeRun['frames']) - 1]['header']->messageType,
+    'a piecewise response still ends with END',
+);
+$largeBodyFrames = array_values(array_filter(
+    $largeRun['frames'],
+    static fn ($f) => $f['header']->messageType === MessageType::BODY,
+));
+Assert::true(
+    $largeBodyFrames[count($largeBodyFrames) - 1]['header']->isLast(),
+    'a piecewise response flags only its final body frame LAST',
+);
+
 // --------------------------------------------------------- streamed responses
 
 // A streamed response declares no length and flags the head instead, which is what

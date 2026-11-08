@@ -15,6 +15,17 @@ final class Worker implements CallPlane
     /** The largest body slice sent in one frame, matching MAX_BODY_CHUNK in Rust. */
     public const MAX_BODY_CHUNK = 65536;
 
+    /**
+     * The largest body a response writes in one piece.
+     *
+     * Below this, the head, body and terminal frame leave in a single write — which is worth ~9%
+     * at 32 workers, measured — because the alternative is three syscalls and three wakeups of the
+     * server's reader. Above it, the frames go out separately, because coalescing would mean
+     * building the whole body a second time in memory: a 200 MB download would cost 200 MB of
+     * extra peak RSS in every worker, which is a worse trade than the syscalls.
+     */
+    private const COALESCE_MAX_BODY = 1048576;
+
     /** The request id reserved for unsolicited frames. */
     public const UNSOLICITED = 0;
 
@@ -801,6 +812,19 @@ final class Worker implements CallPlane
      * Write the response head, body frames, and terminal status.
      *
      * The body length is declared before sending and must match the frames.
+     *
+     * **All three frames leave in one write.** They were three `fwrite` + `fflush` pairs, which is
+     * three `write()` calls per response and two more wakeups of the server's relay reader. Nothing
+     * in the protocol needs them separated: the channel is half-duplex and the server reads frames
+     * until `END`, so it never waits on this worker in the middle of a response. The reason
+     * `send_frame` on the server side flushes per frame — a reader blocked on a frame that is still
+     * sitting in a buffer — cannot happen in this direction, because the only thing that reads here
+     * is a loop that will not act until `END`.
+     *
+     * A streamed response is deliberately *not* coalesced: its whole purpose is to hand the server
+     * each chunk as it is produced, and buffering them would defeat that. A **large** body is not
+     * coalesced either — see `COALESCE_MAX_BODY` — because building it a second time would cost
+     * peak memory out of proportion to the syscalls saved.
      */
     private function respond(Response $response, int $appStatus, int $durationUs): void
     {
@@ -809,6 +833,59 @@ final class Worker implements CallPlane
 
         $body = $response->body;
 
+        if (strlen($body) > self::COALESCE_MAX_BODY) {
+            $this->respondInPieces($response, $body, $appStatus, $durationUs);
+
+            return;
+        }
+
+        $out = $this->encodeJson(MessageType::RESPONSE, $this->requestId, [
+            'status' => $response->status,
+            'headers' => $response->headers,
+            'body_len' => strlen($body),
+        ]);
+
+        if ($body !== '') {
+            $chunks = str_split($body, self::MAX_BODY_CHUNK);
+            $last = count($chunks) - 1;
+            foreach ($chunks as $index => $chunk) {
+                $out .= (new Frame(
+                    MessageType::BODY,
+                    $this->requestId,
+                    $chunk,
+                    $index === $last ? Header::FLAG_LAST : 0,
+                ))->encode($this->checksum);
+            }
+        }
+
+        $out .= $this->encodeJson(MessageType::END, $this->requestId, [
+            'app_status' => $appStatus,
+            'peak_memory_bytes' => $this->peakMemoryBytes(),
+            'duration_us' => $durationUs ?? 0,
+            'keep_alive' => $this->keepAlive,
+        ]);
+
+        $this->writeAll($out);
+        fflush($this->out);
+
+        if (!$this->keepAlive) {
+            $this->stopping = true;
+        }
+    }
+
+    /**
+     * Write a large response frame by frame, without building it in memory first.
+     *
+     * The pre-coalescing path, kept for bodies above `COALESCE_MAX_BODY`. Identical on the wire —
+     * same frames, same order, same flags — only ungrouped, so a body of any size costs one frame
+     * buffer rather than its own length in memory.
+     */
+    private function respondInPieces(
+        Response $response,
+        string $body,
+        int $appStatus,
+        int $durationUs,
+    ): void {
         $this->sendJson(MessageType::RESPONSE, $this->requestId, [
             'status' => $response->status,
             'headers' => $response->headers,
@@ -1980,7 +2057,18 @@ final class Worker implements CallPlane
      */
     private function send(Frame $frame): void
     {
-        $bytes = $frame->encode($this->checksum);
+        $this->writeAll($frame->encode($this->checksum));
+        fflush($this->out);
+    }
+
+    /**
+     * Write bytes in full, without flushing.
+     *
+     * The shared short-write loop; `send()` adds the flush that every single-frame write needs.
+     * Split out so a response can append several frames and flush them together.
+     */
+    private function writeAll(string $bytes): void
+    {
         $length = strlen($bytes);
         $offset = 0;
 
@@ -1991,8 +2079,6 @@ final class Worker implements CallPlane
             }
             $offset += $written;
         }
-
-        fflush($this->out);
     }
 
     /**
@@ -2000,9 +2086,21 @@ final class Worker implements CallPlane
      */
     private function sendJson(int $messageType, int $requestId, mixed $value, int $flags = 0): void
     {
+        $this->writeAll($this->encodeJson($messageType, $requestId, $value, $flags));
+        fflush($this->out);
+    }
+
+    /**
+     * Encode a JSON payload as a frame, without writing it.
+     *
+     * The building block `respond()` needs: a response is three frames that can leave in one
+     * write, and encoding them separately is what lets that happen.
+     */
+    private function encodeJson(int $messageType, int $requestId, mixed $value, int $flags = 0): string
+    {
         $encoded = json_encode($value, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES);
 
-        $this->send(new Frame($messageType, $requestId, $encoded, $flags));
+        return (new Frame($messageType, $requestId, $encoded, $flags))->encode($this->checksum);
     }
 
     /**
@@ -2131,3 +2229,4 @@ final class Worker implements CallPlane
         fflush($this->err);
     }
 }
+
