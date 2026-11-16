@@ -11,8 +11,8 @@ listed here as unreleased is not installed by anyone until the tag exists.
 
 ## [0.4.2] - 2026-11-16
 
-Installed by `composer require` from this tag. A patch release: every existing call keeps its
-behavior, and the wire protocol, the configuration and the frames on the socket are untouched.
+Installed by `composer require` from this tag. A patch release: the wire protocol, the
+configuration and the frames on the socket are untouched.
 
 ### Changed
 
@@ -31,12 +31,9 @@ behavior, and the wire protocol, the configuration and the frames on the socket 
   named argument `children:` to set the child count; a positional second argument is rejected because
   that position is reserved for the handler.
 
-  The signature is wider — `callable|string|null $relay` instead of `?string $relay`, with `$handler`
-  defaulting to `null` — so a call that worked before still type-checks. The two new rejections
-  (`serve($relay)` and `serve($handler, 4)`) throw `InvalidArgumentException` naming the fix, where
-  the old signature failed with a `TypeError` or a "too few arguments" `ArgumentCountError`; a
-  call that was valid at runtime before is not made invalid by this change. The README documents
-  the four accepted shapes in a table.
+  The signature widened to allow it: `$relay` is now `callable|string|null` rather than `?string`, and
+  `$handler` defaults to `null`. The two refusals above throw `InvalidArgumentException` naming the
+  right call, where the old signature stopped with a `TypeError` or `ArgumentCountError`.
 
 ## [0.4.1] - 2026-11-08
 
