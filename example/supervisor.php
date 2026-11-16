@@ -97,5 +97,7 @@ $handler = static function (Request $request, Worker $worker) use ($startedAt): 
     return null;
 };
 
-// `relay()` has already resolved the argument against `VOLUCER_RELAY_SOCKET`, so this is an address.
+// The relay is already resolved by `relay()`, so this is an address. It is passed explicitly on
+// purpose, in the form a deployment uses when the socket lives somewhere the environment does not
+// name; the short `Supervisor::serve($handler)` works too and is what the README shows.
 Supervisor::serve($relay, $handler);

@@ -7,10 +7,28 @@ All notable changes to `sailantis/volucer-worker` are recorded here. The format 
 Versions are also tagged in git, and `composer require` resolves to the highest tag — so a fix
 listed here as unreleased is not installed by anyone until the tag exists.
 
+## [Unreleased]
+
+### Changed
+
+- **The relay argument in `Supervisor::serve()` is now optional.** If omitted, the relay address is
+  read from `VOLUCER_RELAY_SOCKET`, so supervisors can pass the handler as the only argument:
+
+  ```php
+  Volucer\Supervisor::serve($handler);
+  Volucer\Supervisor::serve($handler, children: 4);
+  ```
+
+  Existing calls remain supported: `serve($relay, $handler)`, `serve($relay, $handler, $children)`,
+  and `serve(null, $handler)` retain their behavior. The method distinguishes the forms by whether a
+  second argument is present, not by the first argument's type, because function names can be valid
+  handlers. A lone address is rejected because the handler is missing. In the short form, use the
+  named argument `children:` to set the child count; a positional second argument is rejected because
+  that position is reserved for the handler.
+
 ## [0.4.1] - 2026-11-08
 
-Installed by `composer require` from this tag. A patch release: same frames, same protocol, fewer
-syscalls. No configuration changes and no API changes.
+Installed by `composer require` from this tag. A patch release: same frames, same protocol, fewer syscalls. No configuration changes and no API changes.
 
 ### Performance
 
@@ -36,7 +54,7 @@ syscalls. No configuration changes and no API changes.
 ## [0.4.0] - 2026-11-07
 
 Installed by `composer require` from this tag. Adds the CGI-globals opt-out and fixes two
-request-handling bugs — read *Fixed* below before upgrading a worker that reads `$_SERVER`.
+request-handling bugs — read _Fixed_ below before upgrading a worker that reads `$_SERVER`.
 
 ### Added
 
@@ -64,7 +82,7 @@ request-handling bugs — read *Fixed* below before upgrading a worker that read
 ## [0.3.0] - 2026-11-04
 
 Installed by `composer require` from this tag. A deployment still on `0.2.0` has the two
-read-deadline bugs described under *Fixed*.
+read-deadline bugs described under _Fixed_.
 
 ### Added
 
@@ -78,7 +96,7 @@ read-deadline bugs described under *Fixed*.
   the `BODY` frame marked `LAST`, rather than rejected.
 - **`answers_ping` is advertised in the `HELLO_ACK`.** The SDK has always answered a `PING` with a
   `PONG`, but the server had no way to know that, so it never sent one — and it cannot find out by
-  trying, because a worker that does *not* understand a `PING` treats it as an unknown message type
+  trying, because a worker that does _not_ understand a `PING` treats it as an unknown message type
   and exits, since skipping one would misalign its reader. Announcing the capability is what lets a
   deployment turn on the server's `idle_ping_ms`, which pings an idle connection so that a read
   deadline cannot land on it. A worker on an older SDK simply never advertises it and is never
@@ -107,7 +125,7 @@ read-deadline bugs described under *Fixed*.
 - **A frame header that arrives in pieces was rejected.** `stream_get_contents($h, 16)` does not
   block until it has 16 bytes; it returns as soon as anything is available, and it returns a
   partial buffer when the deadline lands mid-header. `readHeader()` passed that straight to
-  `Header::decode()`, which throws on anything that is not exactly 16 bytes — so a merely *slow*
+  `Header::decode()`, which throws on anything that is not exactly 16 bytes — so a merely _slow_
   server killed the worker with:
 
       ProtocolException: a frame header is exactly 16 bytes, got 8
@@ -120,9 +138,9 @@ read-deadline bugs described under *Fixed*.
   slow peer and keeps reading.
 
 Setting `default_socket_timeout = -1` also avoids both bugs, and remains supported. It cannot be
-relied on as *the* fix, though: a `-d` flag on the supervisor is invisible to a worker that
+relied on as _the_ fix, though: a `-d` flag on the supervisor is invisible to a worker that
 inherits the connection, and a framework bootstrap or an application's own `ini_set` can put a
-deadline back. The deadline is a policy for how long a *request* may take, and the protocol
+deadline back. The deadline is a policy for how long a _request_ may take, and the protocol
 already carries one (`request_timeout`, enforced by the server); a deadline on the idle read is a
 different thing and must not be able to end a worker.
 

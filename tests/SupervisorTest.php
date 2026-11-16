@@ -138,6 +138,98 @@ if (is_string($previousRelay)) {
     $withoutRelay();
 }
 
+// ------------------------------------------------- the handler as the only argument
+
+/*
+ * The relay is usually the environment's to name, so `serve()` must take the handler alone. PHP has
+ * no overloading, so the shape is inferred, and the rule is the one that cannot be confused: with no
+ * second argument the first is the handler, whatever it is spelled as.
+ *
+ * Only the *refusals* are asserted here, and that is deliberate: every accepted shape ends in a
+ * listener that blocks, so an accepted shape is proved either by the fork tests below (on a build
+ * that can fork) or by observing that `serve()` got past its arguments to the refusal before the
+ * fork (on one that cannot). Nothing in this section may reach `listen()` on any build.
+ */
+
+/** The message of whatever `$call` throws, or `null` if it returned. */
+function supervisor_refusal(callable $call): ?string
+{
+    try {
+        $call();
+    } catch (\Throwable $thrown) {
+        return $thrown->getMessage();
+    }
+
+    return null;
+}
+
+$handler = static fn () => null;
+
+// Only one argument, and it is not a handler. Refused rather than read as a relay: a supervisor that
+// started listening on a function name would be a mystery at runtime, and the address alone is the
+// mistake an operator is most likely to make because it is the other argument's value.
+Assert::contains(
+    'no handler',
+    (string) supervisor_refusal(static fn () => Supervisor::serve('/run/app.sock')),
+    'a lone address is refused as a missing handler, not mistaken for the handler',
+);
+Assert::contains(
+    'Supervisor::serve($relay, $handler)',
+    (string) supervisor_refusal(static fn () => Supervisor::serve('unix:/run/app.sock')),
+    'and the refusal shows the call that would have worked',
+);
+Assert::contains(
+    'none was given',
+    (string) supervisor_refusal(static fn () => Supervisor::serve()),
+    'no arguments at all says so plainly',
+);
+Assert::contains(
+    'is not one',
+    (string) supervisor_refusal(static fn () => Supervisor::serve('nope_no_such_function')),
+    'a mistyped function name is refused at startup, not on the first request in a child',
+);
+/*
+ * A handler first and a number second is the cap in the wrong slot, which this signature invites:
+ * `serve($handler, 4)` reads like the long form. Two refusals are correct depending on the caller's
+ * `strict_types` — a `TypeError` on argument #2 where it is declared, and the named-`children` hint
+ * below where `4` coerces to `"4"` and the second slot accepts a string. Either is fine; what must
+ * not happen is the call being accepted.
+ */
+$positionalCap = (string) supervisor_refusal(static fn () => Supervisor::serve($handler, 4));
+Assert::true(
+    str_contains($positionalCap, 'children: 4') || str_contains($positionalCap, 'Argument #2'),
+    'a positional cap in the short form is refused, naming the argument or the named form, got: '
+        . $positionalCap,
+);
+Assert::contains(
+    'swap them',
+    (string) supervisor_refusal(static fn () => Supervisor::serve($handler, 'unix:/run/app.sock')),
+    'a handler and a relay in the wrong order is named as the swap it is',
+);
+
+/*
+ * On a build without `pcntl` every accepted shape stops at the fork, which is *after* the arguments
+ * were read — so the observable is that it stopped there rather than complaining about the handler.
+ * On a build that can fork these calls would listen and block, so they are the fork tests' job.
+ */
+if (!$hasFork) {
+    $withoutRelay();
+
+    foreach ([
+        'the handler alone' => static fn () => Supervisor::serve($handler),
+        'the handler and a named cap' => static fn () => Supervisor::serve($handler, children: 4),
+        'a relay and the handler' => static fn () => Supervisor::serve('unix:/run/app.sock', $handler),
+        'a null relay and the handler' => static fn () => Supervisor::serve(null, $handler),
+        'all three, in the original order' => static fn () => Supervisor::serve('unix:/run/app.sock', $handler, 0),
+    ] as $shape => $call) {
+        Assert::contains(
+            'pcntl',
+            (string) supervisor_refusal($call),
+            $shape . ' is accepted as a handler, so the call reaches the fork',
+        );
+    }
+}
+
 /*
  * The refusal on a build without `pcntl` is checked *before* the listener is created, so a
  * supervisor that cannot fork leaves no socket file behind. On a build that can fork the same call
@@ -205,20 +297,30 @@ $cap = (int) $argv[4];
 // from the children's zero boots.
 file_put_contents($log, "boot " . getmypid() . "\n", FILE_APPEND);
 
-Supervisor::serve(
-    $relay,
-    static function (Request $request) use ($log) {
-        file_put_contents($log, "served " . getmypid() . " " . $request->uri . "\n", FILE_APPEND);
-        echo "pid=" . getmypid() . " uri=" . $request->uri;
+$handler = static function (Request $request) use ($log) {
+    file_put_contents($log, "served " . getmypid() . " " . $request->uri . "\n", FILE_APPEND);
+    echo "pid=" . getmypid() . " uri=" . $request->uri;
 
-        return null;
-    },
-    $cap,
-);
+    return null;
+};
+
+// `$argv[5]` selects the call shape, so the short form is exercised by the same fixture rather than
+// by a copy of it that could drift. In the short form the relay is not an argument at all: it is
+// read from `VOLUCER_RELAY_SOCKET`, which `supervisor_start()` puts in the environment.
+if (($argv[5] ?? '') === 'short') {
+    Supervisor::serve($handler, children: $cap);
+} else {
+    Supervisor::serve($relay, $handler, $cap);
+}
 PHP;
 
-/** Start a supervisor fixture and wait until its relay is listening. */
-function supervisor_start(string $dir, int $cap): array
+/**
+ * Start a supervisor fixture and wait until its relay is listening.
+ *
+ * `$shortForm` selects `serve($handler, children: …)` instead of `serve($relay, $handler, …)`: the
+ * two shapes a call may now take, driven through the same fixture so neither can drift.
+ */
+function supervisor_start(string $dir, int $cap, bool $shortForm = false): array
 {
     $script = $dir . '/supervisor.php';
     file_put_contents($script, SUPERVISOR_FIXTURE);
@@ -242,8 +344,16 @@ function supervisor_start(string $dir, int $cap): array
     // not enough, because the machine this was measured on has the variable unset and grpc loaded,
     // which is exactly the state a deployment would be in.
     $environment = array_merge($_ENV, ['GRPC_ENABLE_FORK_SUPPORT' => '1']);
+
+    // The short form has no relay argument, so the fixture's address reaches it the way a deployment
+    // supplies it — through `VOLUCER_RELAY_SOCKET`, the variable both sides read. The long form keeps
+    // passing it explicitly, which is what proves the argument still wins over the environment.
+    if ($shortForm) {
+        $environment[Supervisor::RELAY_ENV] = 'unix:' . $relayPath;
+    }
+
     $process = proc_open(
-        [PHP_BINARY, $script, __DIR__ . '/../autoload.php', 'unix:' . $relayPath, $log, (string) $cap],
+        [PHP_BINARY, $script, __DIR__ . '/../autoload.php', 'unix:' . $relayPath, $log, (string) $cap, $shortForm ? 'short' : ''],
         [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['file', $dir . '/supervisor.err', 'w']],
         $pipes,
         null,
@@ -654,6 +764,39 @@ try {
     );
 
     supervisor_stop($process, $pipes);
+} finally {
+    supervisor_remove($dir);
+}
+
+// ------------------------------------------------------------- the short form, forked
+
+/*
+ * `serve($handler)` and `serve($handler, children: …)` have to be the *same* supervisor as
+ * `serve($relay, $handler, …)` once the environment names the relay — not a reduced one that serves
+ * but, say, ignores the cap. The fixture is shared, so what is asserted here is the two call shapes
+ * and not two implementations: the boot still happens once in the master, each connection still gets
+ * its own child, and the named cap still caps.
+ */
+$dir = supervisor_dir();
+
+try {
+    [$process, $pipes, $relayPath, $log] = supervisor_start($dir, 1, shortForm: true);
+
+    $first = supervisor_exchange($relayPath, '/short-form');
+    Assert::contains('uri=/short-form', $first['body'], 'the short form serves, with the relay from the environment');
+    Assert::true($first['keep_alive'], 'and answers keep_alive, so the slot is held');
+
+    $served = supervisor_served_pids($log);
+    Assert::same(1, count($served), 'the named cap still caps: one child, one connection, no second fork');
+
+    $boots = array_values(array_filter(
+        file($log, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [],
+        static fn (string $line): bool => str_starts_with($line, 'boot '),
+    ));
+    Assert::same(1, count($boots), 'the boot still happens once in the master, not once per child');
+
+    supervisor_stop($process, $pipes);
+    Assert::same(false, file_exists($relayPath), 'and the short form still removes its socket file on the way out');
 } finally {
     supervisor_remove($dir);
 }

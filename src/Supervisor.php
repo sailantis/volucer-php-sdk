@@ -148,9 +148,80 @@ final class Supervisor
      *
      * A null relay uses `VOLUCER_RELAY_SOCKET`. SIGTERM and SIGINT stop accepting
      * connections and give active children a bounded time to finish.
+     *
+     * The relay is optional, and usually the environment's to name, so the handler
+     * may be the only argument. The shape is selected by the presence of a second
+     * argument, not by the first one's type: a handler may be the *name* of a
+     * function, and a relay never is — a relay always carries the `:` of `unix:` or
+     * of `host:port` — so the first argument alone cannot be classified reliably.
+     *
+     *     Supervisor::serve($handler);                 // relay from the environment
+     *     Supervisor::serve($handler, children: 4);    // and a cap
+     *     Supervisor::serve($relay, $handler);         // relay named here
+     *     Supervisor::serve($relay, $handler, 4);
+     *
+     * In the short form the second positional argument is the handler's slot, so a
+     * cap there has to be named: `serve($handler, 4)` reads like the long form and
+     * would mean the opposite, and is refused with a message that says so.
+     *
+     * @param callable|string|null $relay   the relay, or the handler in the short form
+     * @param callable|string|null $handler the handler, absent in the short form
      */
-    public static function serve(?string $relay, callable $handler, int $children = 0): void
-    {
+    public static function serve(
+        callable|string|null $relay = null,
+        callable|string|null $handler = null,
+        int $children = 0,
+    ): void {
+        $address = null;
+
+        if ($handler === null) {
+            // The short form: the handler is the only argument, whatever it is spelled as. A relay
+            // is never callable — it always carries the `:` of `unix:` or of `host:port` — so the
+            // absence of a second argument, not the shape of the first, is what selects this form.
+            if (!is_callable($relay)) {
+                throw new \InvalidArgumentException($relay === null
+                    ? 'no handler: Supervisor::serve() needs a callable, and none was given'
+                    : sprintf(
+                        'no handler: Supervisor::serve() needs a callable, and "%s" is not one.%s',
+                        (string) $relay,
+                        is_string($relay) && self::looksLikeRelay($relay)
+                            ? ' A relay on its own is not enough — pass the handler too:'
+                                . ' Supervisor::serve($relay, $handler)'
+                            : ' A closure, an invokable object or the name of a function that'
+                                . ' exists all work.',
+                    ));
+            }
+
+            $handler = $relay;
+        } elseif (is_callable($relay)) {
+            // A handler in the first slot and something in the second: the order is swapped, or the
+            // cap was passed positionally. Both are the mistake this signature invites, so name
+            // the fix rather than the type error.
+            throw new \InvalidArgumentException(sprintf(
+                'Supervisor::serve() was given a handler first and then %s. Either swap them —'
+                . ' Supervisor::serve($relay, $handler) — or, with no relay to name, pass the cap'
+                . ' by name: Supervisor::serve($handler, children: %s)',
+                is_string($handler) && !self::looksLikeRelay($handler)
+                    ? 'a number'
+                    : (is_string($handler) ? 'a relay' : get_debug_type($handler)),
+                is_string($handler) && ctype_digit($handler) ? $handler : '0',
+            ));
+        } else {
+            $address = is_string($relay) ? $relay : null;
+        }
+
+        if (!is_callable($handler)) {
+            // Only a string can arrive here, because the short form already checked the callable
+            // and a closure satisfies the type declaration. A string may be a function that does
+            // not exist, which the declaration cannot catch and `Worker::run()` would only reach
+            // on the first request — in a child, after the server has been told we are listening.
+            throw new \InvalidArgumentException(sprintf(
+                'the handler must be callable, and "%s" is not; a closure, an invokable object or '
+                . 'the name of a function that exists all work',
+                is_string($handler) ? $handler : get_debug_type($handler),
+            ));
+        }
+
         if ($children < 0) {
             throw new \InvalidArgumentException(sprintf(
                 'children must be 0 (no cap) or greater, got %d',
@@ -160,7 +231,7 @@ final class Supervisor
 
         self::requireFork();
 
-        $relay = Supervisor::relay($relay);
+        $relay = Supervisor::relay($address);
 
         if ($relay === null) {
             throw new \RuntimeException(sprintf(
@@ -403,6 +474,19 @@ final class Supervisor
         ] as $class) {
             class_exists($class);
         }
+    }
+
+    /**
+     * Whether a string is shaped like a relay address rather than a handler name.
+     *
+     * A relay is `unix:<path>` or `<host>:<port>`, so it always contains a colon. A function name
+     * cannot, which is what makes the colon a reliable discriminator for the error messages that
+     * have to tell an operator which of the two slots they filled. It is not what selects the
+     * call shape: that is the presence of the second argument.
+     */
+    private static function looksLikeRelay(string $value): bool
+    {
+        return str_contains($value, ':');
     }
 
     /**

@@ -141,7 +141,6 @@ $app = new App();
 $app->bootstrap();                  // boot before the fork, or every child boots its own
 
 Volucer\Supervisor::serve(
-    null,                           // or 'unix:/run/app/workers.sock'
     static fn (Volucer\Request $request): Volucer\Response => new Volucer\Response(
         200,
         [['Content-Type', 'text/html; charset=utf-8']],
@@ -157,9 +156,10 @@ workers = 16
 ```
 
 The handler is the same callable `Worker::run()` takes, so a worker file usually becomes a
-supervisor by replacing its last line and nothing else.
+supervisor by replacing its last line and nothing else. The relay is optional and usually the
+environment's to name, so it is not in that call at all.
 
-**The address can be written once.** With the first argument `null` the supervisor reads
+**The address can be written once.** With no relay argument the supervisor reads
 `VOLUCER_RELAY_SOCKET`, and so does the server when `relay` is omitted:
 
 ```ini
@@ -175,6 +175,21 @@ file, still wins — so a stale variable in a shell cannot move a deployment, an
 supervisor that names its own socket still means it. `Supervisor::relay($relay = null)` is that
 resolution on its own, for a caller that wants to decide what "missing" means.
 
+**Four shapes, selected by the second argument.** A relay is never `is_callable()`, because it
+always carries the colon of `unix:` or of `host:port`; that is what lets the handler be the only
+argument without the address being guessed at:
+
+| Call                           | Relay comes from | Child cap |
+| ------------------------------ | ---------------- | --------- |
+| `serve($handler)`              | the environment  | no cap    |
+| `serve($handler, children: 4)` | the environment  | `4`       |
+| `serve($relay, $handler)`      | the argument     | no cap    |
+| `serve($relay, $handler, 4)`   | the argument     | `4`       |
+
+A lone address is refused as a missing handler rather than mistaken for one. In the short form a
+positional second argument occupies the handler's slot, so a cap there has to be named —
+`serve($handler, 4)` is refused with a message that shows `children: 4`.
+
 Each child serves exactly one connection and exits. That is what makes recycling cheap — when
 `max_requests` is reached volucer closes the slot, the child sees end-of-file, exits, and the
 supervisor forks a replacement for the next connection. The supervisor reaps its children, so a
@@ -184,7 +199,8 @@ long-lived one does not fill the process table with zombies.
 default (`0`) is _no cap_, which is what an `attach` deployment wants: volucer dials `workers` times
 and holds one connection per slot, so the live children are already bounded by that number. A cap
 below `workers` is not a queue — the surplus dials sit unaccepted in the listen backlog while the
-pool waits for a handshake no child is there to send.
+pool waits for a handshake no child is there to send. In the short form it is passed by name, as
+`children: 4`.
 
 **Unix only.** Windows has no `pcntl`, and `serve()` raises there rather than silently running a
 single process. Use `kind = "worker"` or `kind = "upstream"` on Windows.
@@ -526,6 +542,7 @@ the server opened, and `Supervisor` serves many, forking one child each. See
 
 | Method                                               | Purpose                                                                                       |
 | ---------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| `Supervisor::serve($handler, …)`                     | the relay from the environment; `$children` named — see [the four shapes](#attaching-instead-of-spawning) |
 | `Supervisor::serve($relay, $handler, $children = 0)` | listen on `unix:/path` or `host:port`, fork per connection, block                             |
 | `Supervisor::listen($relay)`                         | bind only, for an application that owns its own accept loop                                   |
 | `Supervisor::relayPath($relay)`                      | the path of a `unix:` relay, or `null` for a TCP one                                          |
