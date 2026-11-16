@@ -9,6 +9,11 @@ listed here as unreleased is not installed by anyone until the tag exists.
 
 ## [Unreleased]
 
+## [0.4.2] - 2026-11-16
+
+Installed by `composer require` from this tag. A patch release: every existing call keeps its
+behavior, and the wire protocol, the configuration and the frames on the socket are untouched.
+
 ### Changed
 
 - **The relay argument in `Supervisor::serve()` is now optional.** If omitted, the relay address is
@@ -25,6 +30,13 @@ listed here as unreleased is not installed by anyone until the tag exists.
   handlers. A lone address is rejected because the handler is missing. In the short form, use the
   named argument `children:` to set the child count; a positional second argument is rejected because
   that position is reserved for the handler.
+
+  The signature is wider — `callable|string|null $relay` instead of `?string $relay`, with `$handler`
+  defaulting to `null` — so a call that worked before still type-checks. The two new rejections
+  (`serve($relay)` and `serve($handler, 4)`) throw `InvalidArgumentException` naming the fix, where
+  the old signature failed with a `TypeError` or a "too few arguments" `ArgumentCountError`; a
+  call that was valid at runtime before is not made invalid by this change. The README documents
+  the four accepted shapes in a table.
 
 ## [0.4.1] - 2026-11-08
 
@@ -166,7 +178,8 @@ different thing and must not be able to end a worker.
 
 First release: the worker protocol, the request/response exchange, and the supervisor.
 
-[Unreleased]: https://github.com/sailantis/volucer-php-sdk/compare/v0.4.1...main
+[Unreleased]: https://github.com/sailantis/volucer-php-sdk/compare/v0.4.2...main
+[0.4.2]: https://github.com/sailantis/volucer-php-sdk/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/sailantis/volucer-php-sdk/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/sailantis/volucer-php-sdk/releases/tag/v0.4.0
 [0.3.0]: https://github.com/sailantis/volucer-php-sdk/releases/tag/v0.3.0
